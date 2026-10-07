@@ -1,0 +1,14 @@
+# Bỏ qua môi trường ảo Python và rác hệ thống
+.venv/
+venv/
+__pycache__/
+
+# Bỏ qua toàn bộ dữ liệu thô và mô hình nặng
+raw_data/
+prepared_data/
+svm_output/
+data_analysis_output/
+*.npz
+*.csv
+*.txt
+*.joblib
