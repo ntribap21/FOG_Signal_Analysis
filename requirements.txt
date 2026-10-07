@@ -1,0 +1,16 @@
+# FOG Signal Analyzer GUI + SVM Training
+# Python 3.12 was used for functional verification.
+# These are version ranges, not a reproducibility lockfile.
+
+# Arrays, tables and signal processing
+numpy>=1.26,<3
+pandas>=2.1,<3
+scipy>=1.11,<2
+
+# Desktop GUI and plots
+PySide6>=6.6,<7
+pyqtgraph>=0.13.3,<0.15
+
+# SVM, preprocessing, evaluation and model persistence
+scikit-learn>=1.3,<2
+joblib>=1.3,<2
