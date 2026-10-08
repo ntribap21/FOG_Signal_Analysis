@@ -2,8 +2,7 @@
 
 Ứng dụng desktop phân tích tín hiệu DAPHNET và chương trình huấn luyện SVM để phân loại **Non-FOG / FOG theo window**.
 
-Tài liệu này dành cho **bản `main.py` một file đã thêm PAN** và **bản `train_fog.py` đã bổ sung evaluation metrics**.
-
+Tài liệu này dành cho **bản `main.py` và bản `train_fog.py` .
 ## 1. Các file và thư mục
 
 | File / thư mục | Công dụng |
