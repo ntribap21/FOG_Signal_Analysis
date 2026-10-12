@@ -1,4 +1,7 @@
-"""Train FOG SVM from prepared CSV/NPZ; test subjects never enter model fitting.
+"""Train FOG SVM from unified data_prepare CSV/NPZ; test subjects never enter model fitting.
+
+Unified configuration: fog-unified-v1 / original14-unified-v1.
+The StandardScaler + SVC training algorithm is retained unchanged.
 
 Examples:
   python train_fog.py --input prepared_data --output svm_output
@@ -11,6 +14,7 @@ Accepted exports:
   Axis rows are pivoted into ONE vector/window; partial channel sets are rejected.
 Raw DAPHNET TXT and unprocessed sensor CSV are not training inputs.
 """
+RELEASE_VERSION = 'fog-unified-1.1'
 import argparse
 import hashlib
 import json

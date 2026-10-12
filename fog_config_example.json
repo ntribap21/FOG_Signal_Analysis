@@ -1,0 +1,44 @@
+{
+  "schema": "original-core-gui-v1",
+  "source_fs": 64.0,
+  "feature_schema": "one-window-sensor-axis-per-row",
+  "selection": {
+    "mode": 0,
+    "start": 0.015,
+    "end": 2374.796,
+    "exclude_zero": true
+  },
+  "controls": {
+    "resample_checkbox": true,
+    "target_fs_spinbox": 64.0,
+    "filter_checkbox": true,
+    "filter_type_combo": "Low-pass",
+    "filter_order_spinbox": 4.0,
+    "cutoff_1_spinbox": 16.0,
+    "cutoff_2_spinbox": 12.0,
+    "detrend_checkbox": true,
+    "detrend_type_combo": "Linear",
+    "windowing_sensor_combo": "Ankle",
+    "windowing_axis_x_checkbox": true,
+    "windowing_axis_y_checkbox": true,
+    "windowing_axis_z_checkbox": true,
+    "window_length_spinbox": 2.0,
+    "window_overlap_spinbox": 50.0,
+    "window_label_mode_combo": "Majority",
+    "window_fog_threshold_spinbox": 50.0
+  },
+  "filter_implementation": "original filtfilt; lfilter fallback on short segments",
+  "label_mapping": {
+    "0": null,
+    "1": 0,
+    "2": 1
+  },
+  "processing_order": [
+    "selection",
+    "resample",
+    "filter",
+    "detrend",
+    "windowing"
+  ],
+  "config_id": "a890d80da9f8338e"
+}
