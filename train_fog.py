@@ -1,12 +1,16 @@
 """Train FOG SVM from unified data_prepare CSV/NPZ; test subjects never enter model fitting.
 
 Unified configuration: fog-unified-v1 / original14-unified-v1.
-The StandardScaler + SVC training algorithm is retained unchanged.
+StandardScaler + SVC, original features and data/config loading are preserved.
+Optional subject-grouped threshold validation; nested C/gamma CV if --tune is also used.
+FOG is predicted iff decision_function(X) > saved decision_threshold.
+Threshold targets are validation constraints, not guarantees on test patients.
 
 Examples:
   python train_fog.py --input prepared_data --output svm_output
   python train_fog.py --input prepared_data --kernel rbf --tune --cv-folds 3
   python train_fog.py --input features.npz --test-subjects S02 S08
+  python train_fog.py --input features.npz --output validation_run --test-subjects S02 S06 S09 --threshold-tuning --threshold-method exact
 
 Accepted exports:
 - data_prepare: one row/window, features such as Ankle_Forward_RMS.
@@ -25,6 +29,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import sklearn
+from sklearn.base import clone
 from sklearn.metrics import (accuracy_score, average_precision_score, balanced_accuracy_score,
                              classification_report, confusion_matrix, f1_score, roc_auc_score)
 from sklearn.model_selection import GridSearchCV, GroupShuffleSplit, StratifiedGroupKFold
@@ -367,52 +372,307 @@ def diagnostic_metrics(y_true, y_pred):
     }
 
 
+TRAINER_VERSION = 'fog-unified-1.1-validation-1'
+
+
+def _write_json(path, value):
+    Path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2,
+                                    allow_nan=False), encoding='utf-8')
+
+
+def _group_folds(X, y, groups, n_splits, seed, require_validation_classes=False):
+    if not 2 <= n_splits <= len(np.unique(groups)):
+        raise ValueError('Số CV fold cần từ 2 đến số bệnh nhân của tập fit.')
+    splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    folds = list(splitter.split(X, y, groups))
+    for fold, (fit_idx, val_idx) in enumerate(folds, 1):
+        if set(groups[fit_idx]) & set(groups[val_idx]):
+            raise ValueError(f'Fold {fold}: bệnh nhân trùng giữa fit và validation.')
+        if len(np.unique(y[fit_idx])) < 2:
+            raise ValueError(f'Fold {fold}: tập fit thiếu lớp; đổi thiết kế CV.')
+        if require_validation_classes and len(np.unique(y[val_idx])) < 2:
+            raise ValueError(f'Fold {fold}: validation thiếu lớp cho GridSearch F1; đổi thiết kế CV.')
+    return folds
+
+
+def _fit_model(pipeline, X, y, groups, *, tune, kernel, cv_folds,
+               seed, n_jobs, prefix='Final'):
+    if not tune:
+        return clone(pipeline).fit(X, y), None, None, None, None
+    folds = _group_folds(X, y, groups, cv_folds, seed,
+                         require_validation_classes=True)
+    grid = {'svm__C': [.1, 1., 10., 100.]}
+    if kernel == 'rbf':
+        grid['svm__gamma'] = ['scale', .01, .1]
+    search = GridSearchCV(clone(pipeline), grid, scoring='f1', cv=folds,
+                          n_jobs=n_jobs, refit=True, error_score='raise',
+                          return_train_score=False)
+    print(f'{prefix}: tuning C/gamma, {cv_folds} grouped folds, F1(FOG).', flush=True)
+    search.fit(X, y)
+    records = pd.DataFrame([
+        {'Fold': i, 'Fit_Subjects': ','.join(np.unique(groups[a])),
+         'Validation_Subjects': ','.join(np.unique(groups[b]))}
+        for i, (a, b) in enumerate(folds, 1)])
+    return (search.best_estimator_, pd.DataFrame(search.cv_results_),
+            search.best_params_, float(search.best_score_), records)
+
+
+def patient_validation_scores(pipeline, X, y, groups, *, cv_folds=3, seed=42,
+                              tune=False, inner_cv_folds=3, kernel='rbf', n_jobs=1):
+    """Out-of-fold scores; outer-validation subjects never enter scaler/SVM or inner tuning."""
+    scores = np.full(len(y), np.nan)
+    fold_ids = np.full(len(y), -1, dtype=int)
+    records = []
+    folds = _group_folds(X, y, groups, cv_folds, seed)
+    for fold, (fit_idx, val_idx) in enumerate(folds, 1):
+        print(f'Validation fold {fold}/{cv_folds}: fit '
+              f'{list(np.unique(groups[fit_idx]))}; validation '
+              f'{list(np.unique(groups[val_idx]))}', flush=True)
+        model, _, params, cv_score, _ = _fit_model(
+            pipeline, X[fit_idx], y[fit_idx], groups[fit_idx],
+            tune=tune, kernel=kernel, cv_folds=inner_cv_folds,
+            seed=seed, n_jobs=n_jobs, prefix=f'Outer fold {fold}')
+        if model.classes_.tolist() != [0, 1]:
+            raise ValueError('SVM classes phải là [0, 1] để score dương hướng về FOG.')
+        scores[val_idx] = model.decision_function(X[val_idx])
+        fold_ids[val_idx] = fold
+        records.append({
+            'Fold': fold, 'Fit_Subjects': ','.join(np.unique(groups[fit_idx])),
+            'Validation_Subjects': ','.join(np.unique(groups[val_idx])),
+            'Fit_Windows': len(fit_idx), 'Validation_Windows': len(val_idx),
+            'Validation_FOG': int(np.sum(y[val_idx] == 1)),
+            'Best_Params': json.dumps(params), 'Best_Inner_CV_F1': cv_score})
+    if not np.isfinite(scores).all() or np.any(fold_ids < 1):
+        raise ValueError('Có cửa sổ chưa nhận score validation hợp lệ.')
+    return scores, fold_ids, pd.DataFrame(records)
+
+
+def sweep_validation_thresholds(y, scores, *, min_sensitivity=.85,
+                                min_specificity=.85, method='grid',
+                                threshold_min=-1.5, threshold_max=.5,
+                                threshold_step=.02):
+    """FOG iff score > threshold. Counts include score ties consistently."""
+    y = np.asarray(y)
+    scores = np.asarray(scores, dtype=float)
+    if scores.shape != y.shape or not np.isfinite(scores).all():
+        raise ValueError('Scores validation không hợp lệ.')
+    if len(np.unique(y)) != 2 or not np.isin(y, [0, 1]).all():
+        raise ValueError('Validation gộp cần cả FOG và Non-FOG.')
+    if not all(np.isfinite(v) and 0 <= v <= 1
+               for v in (min_sensitivity, min_specificity)):
+        raise ValueError('Mục tiêu Sensitivity/Specificity cần nằm trong [0,1].')
+    if method == 'exact':
+        unique = np.unique(scores)
+        lower = np.nextafter(unique[0], -np.inf)
+        if not np.isfinite(lower):
+            raise ValueError('Score quá lớn để tạo ngưỡng exact.')
+        thresholds = np.r_[lower, unique]
+    elif method == 'grid':
+        if (not all(np.isfinite(v) for v in (threshold_min, threshold_max, threshold_step))
+                or threshold_min >= threshold_max or threshold_step <= 0):
+            raise ValueError('Khoảng quét cần min < max, step >0 và hữu hạn.')
+        if (threshold_max - threshold_min) / threshold_step > 20000:
+            raise ValueError('Quá nhiều ngưỡng grid; tăng step hoặc dùng exact.')
+        count = int(np.floor((threshold_max - threshold_min) / threshold_step))
+        thresholds = np.unique(np.r_[threshold_min + np.arange(count + 1) * threshold_step,
+                                     threshold_max])
+    else:
+        raise ValueError('Threshold method cần grid hoặc exact.')
+    order = np.argsort(scores)
+    sorted_scores, sorted_y = scores[order], y[order]
+    prefix_positive = np.r_[0, np.cumsum(sorted_y == 1)]
+    cut = np.searchsorted(sorted_scores, thresholds, side='right')
+    fn = prefix_positive[cut]
+    tn = cut - fn
+    positives = int(np.sum(y == 1)); negatives = len(y) - positives
+    tp = positives - fn; fp = negatives - tn
+    sens, spec = tp / positives, tn / negatives
+    ppv = np.divide(tp, tp + fp, out=np.full(len(tp), np.nan), where=(tp + fp) != 0)
+    npv = np.divide(tn, tn + fn, out=np.full(len(tp), np.nan), where=(tn + fn) != 0)
+    f1 = 2 * tp / (2 * tp + fp + fn)
+    table = pd.DataFrame({
+        'Decision_Threshold': thresholds, 'Sensitivity': sens, 'Specificity': spec,
+        'Accuracy': (tp + tn) / len(y), 'PPV': ppv, 'NPV': npv,
+        'F1_FOG': f1, 'Balanced_Accuracy': (sens + spec) / 2,
+        'Youden_Index': sens + spec - 1,
+        'TN': tn, 'FP': fp, 'FN': fn, 'TP': tp,
+        'Meets_Target': (sens >= min_sensitivity) & (spec >= min_specificity)})
+    eligible = table[table.Meets_Target]
+    selected = None
+    if not eligible.empty:
+        # Max sensitivity; tie: max specificity; remaining tie: largest threshold.
+        selected = float(eligible.sort_values(
+            ['Sensitivity', 'Specificity', 'Decision_Threshold'],
+            ascending=[False, False, False]).iloc[0].Decision_Threshold)
+    return table, selected
+
+
+def _patient_metrics(y, scores, groups, threshold):
+    records = []
+    for subject in np.unique(groups):
+        mask = groups == subject
+        truth = y[mask]; prediction = (scores[mask] > threshold).astype(np.int8)
+        result = diagnostic_metrics(truth, prediction)
+        records.append({
+            'Subject_ID': subject, 'Decision_Threshold': float(threshold),
+            'N_Windows': int(np.sum(mask)), 'N_FOG': int(np.sum(truth == 1)),
+            'Sensitivity': result['sensitivity'], 'Specificity': result['specificity'],
+            'Accuracy': result['accuracy'], 'PPV': result['ppv'], 'NPV': result['npv'],
+            'Youden_Index': result['youden_index'],
+            'F1_FOG': float(f1_score(truth, prediction, zero_division=0)),
+            **result['confusion_counts']})
+    return pd.DataFrame(records)
+
+
+def predict_with_threshold(bundle, X):
+    """Inference on unscaled feature vectors in bundle feature_names order."""
+    X = np.asarray(X, dtype=float)
+    if X.ndim != 2 or X.shape[1] != len(bundle['feature_names']) or not np.isfinite(X).all():
+        raise ValueError('X inference sai kích thước hoặc chứa NaN/Inf.')
+    score = bundle['pipeline'].decision_function(X)
+    threshold = float(bundle.get('decision_threshold', 0.))
+    return (score > threshold).astype(np.int8), score
+
+
+def _manifest(data, train_idx, test_idx):
+    split = np.full(len(data['y']), 'train', dtype='<U5')
+    split[test_idx] = 'test'
+    return pd.DataFrame({
+        'Subject_ID': data['subject_id'], 'Recording_ID': data['recording_id'],
+        'Segment_ID': data['segment_id'], 'Window_ID': data['window_id'],
+        'Start_Time': data['window_start'], 'End_Time': data['window_end'],
+        'Binary_Label': data['y'], 'Source_File': data['source_file'], 'Split': split})
+
+
+def _save_validation(output, manifest, train_idx, y, groups, scores, fold_ids,
+                     folds, sweep, selected, targets, nested):
+    target_met = selected is not None
+    # When target unmet, report the best balanced candidate ONLY for diagnostics.
+    diagnostic = float(sweep.sort_values(
+        ['Balanced_Accuracy', 'F1_FOG', 'Decision_Threshold'],
+        ascending=[False, False, False]).iloc[0].Decision_Threshold)
+    reporting = float(selected) if target_met else diagnostic
+    role = 'selected_on_validation' if target_met else 'diagnostic_only_target_unmet'
+    predictions = (scores > reporting).astype(np.int8)
+    sweep.to_csv(output / 'validation_threshold_sweep.csv', index=False)
+    folds.to_csv(output / 'validation_folds.csv', index=False)
+    windows = manifest.iloc[train_idx].copy()
+    windows['Split'] = 'validation_oof'
+    windows['Validation_Fold'] = fold_ids
+    windows['FOG_Decision_Score'] = scores
+    windows['Prediction'] = predictions
+    windows['Decision_Threshold'] = reporting
+    windows['Threshold_Role'] = role
+    windows.to_csv(output / 'validation_scores.csv', index=False)
+    patients = _patient_metrics(y, scores, groups, reporting)
+    patients['Threshold_Role'] = role
+    patients.to_csv(output / 'validation_patient_metrics.csv', index=False)
+    fold_metrics = []
+    for fold in np.unique(fold_ids):
+        mask = fold_ids == fold
+        result = diagnostic_metrics(y[mask], predictions[mask])
+        fold_metrics.append({'Fold': int(fold), 'Decision_Threshold': reporting,
+                             'Threshold_Role': role,
+                             **{k: result[k] for k in ('sensitivity', 'specificity', 'accuracy')},
+                             **result['confusion_counts']})
+    pd.DataFrame(fold_metrics).to_csv(output / 'validation_fold_metrics.csv', index=False)
+    summary = {'status': 'target_met' if target_met else 'target_not_met',
+               'target_met': target_met, 'selected_threshold': selected,
+               'diagnostic_candidate_threshold': diagnostic,
+               'reporting_threshold': reporting, 'reporting_threshold_role': role,
+               'targets': targets, 'nested_hyperparameter_tuning': bool(nested),
+               'selection_rule': 'max sensitivity subject to both targets; ties: specificity, threshold',
+               'evaluation_unit': 'window; pooled OOF counts, not mean patient sensitivity',
+               'n_validation_windows': len(y), 'subjects': np.unique(groups).tolist(),
+               'reporting_metrics': diagnostic_metrics(y, predictions),
+               'notes': ['Validation scores select a threshold; they are not an independent final performance estimate.',
+                         'Each outer fold fits its own scaler and SVM; refitting can change score scale.',
+                         'Only thresholds in the exported sweep were considered.']}
+    _write_json(output / 'validation_metrics.json', summary)
+    return summary
+
+
 def train(paths, output, test_size=.25, seed=42, *, kernel='rbf', C=1., gamma='scale',
-          tune=False, cv_folds=3, test_subjects=None, n_jobs=1, cache_size=512.):
-    data, names, config = load_datasets(paths)
-    train_idx, test_idx = _split(data, test_size, seed, test_subjects)
+          tune=False, cv_folds=3, test_subjects=None, n_jobs=1, cache_size=512.,
+          decision_threshold=0., threshold_tuning=False, min_sensitivity=.85,
+          min_specificity=.85, threshold_method='grid', threshold_min=-1.5,
+          threshold_max=.5, threshold_step=.02, inner_cv_folds=3):
     if kernel not in ('rbf', 'linear') or not np.isfinite(C) or C <= 0 or not np.isfinite(cache_size) or cache_size <= 0:
         raise ValueError('Kernel phải là rbf/linear; C và cache-size phải >0.')
-    if isinstance(gamma, (float, int)) and gamma <= 0:
-        raise ValueError('Gamma phải >0 hoặc scale/auto.')
+    if isinstance(gamma, (float, int)):
+        if not np.isfinite(gamma) or gamma <= 0:
+            raise ValueError('Gamma phải >0 và hữu hạn.')
+    elif gamma not in ('scale', 'auto'):
+        raise ValueError('Gamma cần scale/auto hoặc số >0.')
+    if not np.isfinite(decision_threshold):
+        raise ValueError('Decision threshold phải hữu hạn.')
+    if not all(np.isfinite(v) and 0 <= v <= 1 for v in (min_sensitivity, min_specificity)):
+        raise ValueError('Mục tiêu Sensitivity/Specificity cần nằm trong [0,1].')
+    if threshold_tuning and decision_threshold != 0.:
+        raise ValueError('Không dùng --decision-threshold khác 0 cùng --threshold-tuning.')
+    output = Path(output)
+    if threshold_tuning and output.exists() and any(output.iterdir()):
+        raise ValueError('Chọn thư mục output mới/rỗng cho validation để tránh trộn kết quả cũ.')
+    data, names, config = load_datasets(paths)
+    train_idx, test_idx = _split(data, test_size, seed, test_subjects)
     pipeline = Pipeline([('scaler', StandardScaler()),
                          ('svm', SVC(kernel=kernel, C=C, gamma=gamma, class_weight='balanced',
                                      probability=False, cache_size=cache_size))])
     X_train, y_train = data['X'][train_idx], data['y'][train_idx]
     train_groups = data['subject_id'][train_idx]
-    cv_results, best_params, best_score = None, None, None
     print(f'{len(data["y"]):,} windows · {len(names)} features · {len(np.unique(data["subject_id"]))} subjects', flush=True)
     print('Train:', ', '.join(np.unique(train_groups)), '| Test:', ', '.join(np.unique(data['subject_id'][test_idx])), flush=True)
     for note in config['notes']:
         print('NOTE:', note, flush=True)
-    if tune:
-        if cv_folds < 2 or cv_folds > len(np.unique(train_groups)):
-            raise ValueError('--cv-folds cần từ 2 đến số subject của tập train.')
-        splitter = StratifiedGroupKFold(n_splits=cv_folds, shuffle=True, random_state=seed)
-        folds = list(splitter.split(X_train, y_train, train_groups))
-        for i, (fit_idx, validation_idx) in enumerate(folds, 1):
-            if len(np.unique(y_train[fit_idx])) < 2 or len(np.unique(y_train[validation_idx])) < 2:
-                raise ValueError(f'CV fold {i} thiếu lớp; điều chỉnh thiết kế CV hoặc train không --tune.')
-            assert not set(train_groups[fit_idx]) & set(train_groups[validation_idx])
-        grid = {'svm__C': [.1, 1., 10., 100.]}
-        if kernel == 'rbf':
-            grid['svm__gamma'] = ['scale', .01, .1]
-        search = GridSearchCV(pipeline, grid, scoring='f1', cv=folds, n_jobs=n_jobs,
-                              refit=True, error_score='raise', return_train_score=False)
-        print(f'Tuning {kernel} SVM, {cv_folds} subject-grouped folds, scoring F1(FOG).', flush=True)
-        search.fit(X_train, y_train)
-        model = search.best_estimator_;best_params = search.best_params_;best_score = float(search.best_score_)
-        cv_results = pd.DataFrame(search.cv_results_)
-    else:
-        print(f'Training {kernel} SVM (C={C:g}, gamma={gamma})...', flush=True)
-        model = pipeline.fit(X_train, y_train)
-    prediction = model.predict(data['X'][test_idx])
+    output.mkdir(parents=True, exist_ok=True)
+    manifest = _manifest(data, train_idx, test_idx)
+    manifest.to_csv(output / 'split_manifest.csv', index=False)
+    _write_json(output / 'dataset_info.json', config)
+    _write_json(output / 'feature_names.json', names)
+    validation_summary = None
+    if threshold_tuning:
+        val_scores, val_folds, fold_table = patient_validation_scores(
+            pipeline, X_train, y_train, train_groups, cv_folds=cv_folds, seed=seed,
+            tune=tune, inner_cv_folds=inner_cv_folds, kernel=kernel, n_jobs=n_jobs)
+        sweep, selected = sweep_validation_thresholds(
+            y_train, val_scores, min_sensitivity=min_sensitivity,
+            min_specificity=min_specificity, method=threshold_method,
+            threshold_min=threshold_min, threshold_max=threshold_max,
+            threshold_step=threshold_step)
+        targets = {'min_sensitivity': float(min_sensitivity),
+                   'min_specificity': float(min_specificity), 'method': threshold_method,
+                   'threshold_min': float(threshold_min) if threshold_method == 'grid' else None,
+                   'threshold_max': float(threshold_max) if threshold_method == 'grid' else None,
+                   'threshold_step': float(threshold_step) if threshold_method == 'grid' else None}
+        validation_summary = _save_validation(
+            output, manifest, train_idx, y_train, train_groups, val_scores, val_folds,
+            fold_table, sweep, selected, targets, tune)
+        if selected is None:
+            stopped = {'status': 'target_not_met', 'trainer_version': TRAINER_VERSION,
+                       'decision_threshold': None, 'test_evaluated': False,
+                       'validation': validation_summary,
+                       'train_subjects': np.unique(train_groups).tolist(),
+                       'test_subjects': np.unique(data['subject_id'][test_idx]).tolist()}
+            _write_json(output / 'metrics.json', stopped)
+            print('Không có ngưỡng validation đạt cả hai mục tiêu trong bảng quét. '
+                  'Đã lưu diagnostics; không fit model cuối hoặc đánh giá test.', flush=True)
+            return stopped
+        decision_threshold = selected
+        print(f'Selected validation threshold: {decision_threshold:.8g}', flush=True)
+    # Final fitting/tuning uses all training subjects, never test subjects.
+    model, cv_results, best_params, best_score, final_cv_subjects = _fit_model(
+        pipeline, X_train, y_train, train_groups, tune=tune, kernel=kernel,
+        cv_folds=cv_folds, seed=seed, n_jobs=n_jobs)
     scores = model.decision_function(data['X'][test_idx])
+    prediction = (scores > decision_threshold).astype(np.int8)
     y_test = data['y'][test_idx]
     report = classification_report(y_test, prediction, labels=[0, 1], target_names=['Non-FOG', 'FOG'],
                                    output_dict=True, zero_division=0)
     metrics = {'model': 'StandardScaler + SVC', 'kernel': kernel,
-               'class_weight': 'balanced', 'decision_threshold': 0., 'seed': seed,
+               'class_weight': 'balanced', 'decision_threshold': float(decision_threshold), 'seed': seed,
+               'status': 'completed', 'trainer_version': TRAINER_VERSION,
+               'threshold_selection': 'subject-grouped OOF validation' if threshold_tuning else 'fixed',
+               'threshold_tuning': bool(threshold_tuning), 'validation': validation_summary,
                'accuracy': float(accuracy_score(y_test, prediction)),
                'balanced_accuracy': float(balanced_accuracy_score(y_test, prediction)),
                'fog_f1': float(f1_score(y_test, prediction, zero_division=0)),
@@ -436,6 +696,8 @@ def train(paths, output, test_size=.25, seed=42, *, kernel='rbf', C=1., gamma='s
     bundle = {'pipeline': model, 'feature_names': names, 'label_mapping': {0: 'Non-FOG', 1: 'FOG'},
               'processing_config': config, 'model_type': 'SVC', 'metrics': metrics,
               'train_subjects': metrics['train_subjects'], 'test_subjects': metrics['test_subjects']}
+    bundle['decision_threshold'] = float(decision_threshold)
+    bundle['trainer_version'] = TRAINER_VERSION
     joblib.dump(bundle, output / 'fog_svm.joblib')
     (output / 'metrics.json').write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding='utf-8')
     evaluation_names = ['sensitivity', 'specificity', 'ppv', 'npv', 'accuracy',
@@ -464,14 +726,15 @@ def train(paths, output, test_size=.25, seed=42, *, kernel='rbf', C=1., gamma='s
     manifest.to_csv(output / 'split_manifest.csv', index=False)
     test_predictions = manifest.iloc[test_idx].copy()
     test_predictions['Prediction'] = prediction;test_predictions['FOG_Decision_Score'] = scores
+    test_predictions['Decision_Threshold'] = float(decision_threshold)
     test_predictions.to_csv(output / 'test_predictions.csv', index=False)
+    _patient_metrics(y_test, scores, data['subject_id'][test_idx], decision_threshold).to_csv(
+        output / 'test_patient_metrics.csv', index=False)
     pd.DataFrame(metrics['confusion_matrix'], index=['Actual_NonFOG', 'Actual_FOG'],
                  columns=['Predicted_NonFOG', 'Predicted_FOG']).to_csv(output / 'confusion_matrix.csv')
     if cv_results is not None:
         cv_results.to_csv(output / 'cv_results.csv', index=False)
-        pd.DataFrame([{'Fold': i, 'Fit_Subjects': ','.join(np.unique(train_groups[a])),
-                       'Validation_Subjects': ','.join(np.unique(train_groups[b]))}
-                      for i, (a, b) in enumerate(folds, 1)]).to_csv(output / 'cv_subjects.csv', index=False)
+        final_cv_subjects.to_csv(output / 'cv_subjects.csv', index=False)
     print(f'Saved: {output / "fog_svm.joblib"}', flush=True)
     return metrics
 
@@ -502,14 +765,31 @@ def main():
     parser.add_argument('--cv-folds', type=int, default=3)
     parser.add_argument('--n-jobs', type=int, default=1)
     parser.add_argument('--cache-size', type=float, default=512., help='SVC cache in MiB per CV worker')
+    parser.add_argument('--decision-threshold', type=float, default=0., help='Fixed score threshold; FOG iff score > threshold')
+    parser.add_argument('--threshold-tuning', action='store_true', help='Choose score threshold using subject-grouped OOF validation; stop if targets unmet')
+    parser.add_argument('--min-sensitivity', type=float, default=.85)
+    parser.add_argument('--min-specificity', type=float, default=.85)
+    parser.add_argument('--threshold-method', choices=['grid', 'exact'], default='grid')
+    parser.add_argument('--threshold-min', type=float, default=-1.5)
+    parser.add_argument('--threshold-max', type=float, default=.5)
+    parser.add_argument('--threshold-step', type=float, default=.02)
+    parser.add_argument('--inner-cv-folds', type=int, default=3, help='Inner C/gamma CV folds when --tune and --threshold-tuning are combined')
     args = parser.parse_args()
     try:
         paths = discover_inputs(args.input)
         metrics = train(paths, args.output, args.test_size, args.seed, kernel=args.kernel, C=args.C,
                         gamma=args.gamma, tune=args.tune, cv_folds=args.cv_folds,
-                        test_subjects=args.test_subjects, n_jobs=args.n_jobs, cache_size=args.cache_size)
+                        test_subjects=args.test_subjects, n_jobs=args.n_jobs, cache_size=args.cache_size,
+                        decision_threshold=args.decision_threshold, threshold_tuning=args.threshold_tuning,
+                        min_sensitivity=args.min_sensitivity, min_specificity=args.min_specificity,
+                        threshold_method=args.threshold_method, threshold_min=args.threshold_min,
+                        threshold_max=args.threshold_max, threshold_step=args.threshold_step,
+                        inner_cv_folds=args.inner_cv_folds)
     except (ValueError, KeyError, OSError) as exc:
         parser.exit(2, f'ERROR: {exc}\n')
+    if metrics.get('status') == 'target_not_met':
+        print(json.dumps(metrics, ensure_ascii=False, indent=2))
+        parser.exit(2, 'TARGET_NOT_MET: xem validation_threshold_sweep.csv; test chưa được đánh giá.\n')
     print(json.dumps({key: metrics[key] for key in ['sensitivity', 'specificity', 'ppv', 'npv', 'accuracy', 'youden_index', 'balanced_accuracy', 'fog_f1',
                                                    'roc_auc', 'average_precision', 'train_subjects', 'test_subjects']}, indent=2))
 
