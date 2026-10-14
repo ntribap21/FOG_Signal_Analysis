@@ -1,22 +1,26 @@
-"""Train FOG SVM from unified data_prepare CSV/NPZ; test subjects never enter model fitting.
+"""FOG training/evaluation: original features and loader, StandardScaler + SVC.
 
-Unified configuration: fog-unified-v1 / original14-unified-v1.
-StandardScaler + SVC, original features and data/config loading are preserved.
-Optional subject-grouped threshold validation; nested C/gamma CV if --tune is also used.
-FOG is predicted iff decision_function(X) > saved decision_threshold.
-Threshold targets are validation constraints, not guarantees on test patients.
+Compatible with FOG_FIXED_1_1. Raw TXT is NOT an ML training input.
+Input: one prepared CSV/NPZ configuration with Subject_ID metadata.
 
-Examples:
-  python train_fog.py --input prepared_data --output svm_output
-  python train_fog.py --input prepared_data --kernel rbf --tune --cv-folds 3
-  python train_fog.py --input features.npz --test-subjects S02 S08
-  python train_fog.py --input features.npz --output validation_run --test-subjects S02 S06 S09 --threshold-tuning --threshold-method exact
+Modes:
+- holdout (default): existing grouped holdout and validation functionality.
+- loso baseline: leave one entire subject out, fixed C/gamma/threshold.
+- loso --threshold-tuning: ONE inner SGKF selects threshold, fixed C/gamma.
+- loso --tune --threshold-tuning: ONE inner SGKF jointly selects C/gamma/threshold.
+  No GridSearch is run inside the inner fold, so this is TWO CV levels.
 
-Accepted exports:
-- data_prepare: one row/window, features such as Ankle_Forward_RMS.
-- original-core GUI: one row/window/sensor/axis, 14 features per row.
-  Axis rows are pivoted into ONE vector/window; partial channel sets are rejected.
-Raw DAPHNET TXT and unprocessed sensor CSV are not training inputs.
+Examples (use a new output folder for each LOSO run):
+  python train_fog.py --input fog_batch.npz --output holdout_run --test-subjects S02 S06 S09
+  python train_fog.py --input fog_batch.npz --output loso_baseline --evaluation loso
+  python train_fog.py --input fog_batch.npz --output loso_threshold --evaluation loso --threshold-tuning --threshold-method exact
+  python train_fog.py --input fog_batch.npz --output loso_joint --evaluation loso --tune --threshold-tuning --threshold-method exact --cv-folds 3
+
+Targets (.85/.85 by default) are constraints for inner selection, not guarantees
+on outer-test patients. LOSO uses a best-balanced fallback when unmet, and reports
+every subject. Null denotes undefined metrics. Outer models are evaluation models,
+not a deployment model trained on all subjects. FOG iff score > saved threshold.
+The legacy holdout --tune --threshold-tuning path retains its existing extra CV.
 """
 RELEASE_VERSION = 'fog-unified-1.1'
 import argparse
@@ -32,7 +36,7 @@ import sklearn
 from sklearn.base import clone
 from sklearn.metrics import (accuracy_score, average_precision_score, balanced_accuracy_score,
                              classification_report, confusion_matrix, f1_score, roc_auc_score)
-from sklearn.model_selection import GridSearchCV, GroupShuffleSplit, StratifiedGroupKFold
+from sklearn.model_selection import GridSearchCV, GroupShuffleSplit, StratifiedGroupKFold, LeaveOneGroupOut
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
@@ -372,7 +376,7 @@ def diagnostic_metrics(y_true, y_pred):
     }
 
 
-TRAINER_VERSION = 'fog-unified-1.1-validation-1'
+TRAINER_VERSION = 'fog-unified-1.1-loso-2level-1'
 
 
 def _write_json(path, value):
@@ -739,6 +743,343 @@ def train(paths, output, test_size=.25, seed=42, *, kernel='rbf', C=1., gamma='s
     return metrics
 
 
+def _loso_options(kernel, C, gamma, cache_size, decision_threshold,
+                  min_sensitivity, min_specificity, n_jobs):
+    if kernel not in ('rbf', 'linear') or not np.isfinite(C) or C <= 0:
+        raise ValueError('Kernel cần rbf/linear và C >0.')
+    if isinstance(gamma, (int, float)):
+        if not np.isfinite(gamma) or gamma <= 0:
+            raise ValueError('Gamma phải hữu hạn và >0.')
+    elif gamma not in ('scale', 'auto'):
+        raise ValueError('Gamma cần scale/auto hoặc số >0.')
+    if not np.isfinite(cache_size) or cache_size <= 0 or not np.isfinite(decision_threshold):
+        raise ValueError('Cache-size cần >0; decision threshold phải hữu hạn.')
+    if not all(np.isfinite(v) and 0 <= v <= 1 for v in (min_sensitivity, min_specificity)):
+        raise ValueError('Mục tiêu metrics phải nằm trong [0,1].')
+    if n_jobs == 0:
+        raise ValueError('--n-jobs không được bằng 0.')
+
+
+def _candidate_scores(pipeline, X, y, folds, params):
+    """Fixed parameters inside each SGKF fold: no GridSearch or further split."""
+    scores = np.full(len(y), np.nan)
+    for fit_idx, validation_idx in folds:
+        model = clone(pipeline).set_params(**params)
+        model.fit(X[fit_idx], y[fit_idx])
+        if model.classes_.tolist() != [0, 1]:
+            raise ValueError('Classes SVM cần [0, 1].')
+        scores[validation_idx] = model.decision_function(X[validation_idx])
+    if not np.isfinite(scores).all():
+        raise ValueError('Có cửa sổ thiếu score SGKF.')
+    return scores
+
+
+def select_joint_parameters(pipeline, X, y, groups, *, tune=False,
+                            threshold_tuning=False, cv_folds=3, seed=42,
+                            kernel='rbf', decision_threshold=0.,
+                            min_sensitivity=.85, min_specificity=.85,
+                            threshold_method='grid', threshold_min=-1.5,
+                            threshold_max=.5, threshold_step=.02,
+                            C_grid=None, gamma_grid=None, n_jobs=1,
+                            save_all_sweeps=False, output=None):
+    """One SGKF level selects C/gamma/threshold jointly on inner OOF predictions.
+
+    Inner results select parameters; only the outer LOSO test estimates performance.
+    When threshold targets are unmet, a predeclared best-balanced fallback is used.
+    """
+    folds = _group_folds(X, y, groups, cv_folds, seed)
+    base = pipeline.get_params()
+    c_values = list(C_grid if C_grid is not None else [.1, 1., 10., 100.]) if tune else [base['svm__C']]
+    gamma_values = list(gamma_grid if gamma_grid is not None else ['scale', .01, .1]) if tune and kernel == 'rbf' else [base['svm__gamma']]
+    if not c_values or not gamma_values:
+        raise ValueError('Grid rỗng.')
+    for c in c_values:
+        _loso_options(kernel, c, gamma_values[0], 512., decision_threshold,
+                      min_sensitivity, min_specificity, n_jobs)
+    for g in gamma_values:
+        _loso_options(kernel, c_values[0], g, 512., decision_threshold,
+                      min_sensitivity, min_specificity, n_jobs)
+    params_list = [{'svm__C': float(c), 'svm__gamma': g}
+                   for c in dict.fromkeys(c_values) for g in dict.fromkeys(gamma_values)]
+    fold_ids = np.full(len(y), -1, dtype=int)
+    fold_rows = []
+    for fold, (a, b) in enumerate(folds, 1):
+        fold_ids[b] = fold
+        fold_rows.append({'Fold': fold,
+                          'Fit_Subjects': ','.join(np.unique(groups[a])),
+                          'Validation_Subjects': ','.join(np.unique(groups[b])),
+                          'Fit_Windows': len(a), 'Validation_Windows': len(b)})
+    print(f'Inner SGKF: {len(params_list)} candidates × {len(folds)} folds.', flush=True)
+    # Parallelism is across parameter candidates, not an additional CV level.
+    if n_jobs == 1:
+        all_scores = [_candidate_scores(pipeline, X, y, folds, params)
+                      for params in params_list]
+    else:
+        all_scores = joblib.Parallel(n_jobs=n_jobs)(
+            joblib.delayed(_candidate_scores)(pipeline, X, y, folds, params)
+            for params in params_list)
+    candidate_rows, sweeps = [], []
+    for i, (params, scores) in enumerate(zip(params_list, all_scores), 1):
+        if threshold_tuning:
+            sweep, selected = sweep_validation_thresholds(
+                y, scores, min_sensitivity=min_sensitivity,
+                min_specificity=min_specificity, method=threshold_method,
+                threshold_min=threshold_min, threshold_max=threshold_max,
+                threshold_step=threshold_step)
+            if selected is not None:
+                row = sweep.loc[sweep.Decision_Threshold == selected].iloc[0]
+            else:
+                row = sweep.sort_values(
+                    ['Balanced_Accuracy', 'F1_FOG', 'Specificity', 'Decision_Threshold'],
+                    ascending=[False, False, False, False]).iloc[0]
+            record = {k: row[k].item() if hasattr(row[k], 'item') else row[k]
+                      for k in sweep.columns}
+            record['Target_Met'] = selected is not None
+            record['Threshold_Role'] = 'target_met' if selected is not None else 'fallback_best_balanced'
+        else:
+            pred = (scores > decision_threshold).astype(np.int8)
+            result = diagnostic_metrics(y, pred)
+            record = {'Decision_Threshold': float(decision_threshold),
+                      'Sensitivity': result['sensitivity'], 'Specificity': result['specificity'],
+                      'Accuracy': result['accuracy'], 'PPV': result['ppv'], 'NPV': result['npv'],
+                      'F1_FOG': float(f1_score(y, pred, zero_division=0)),
+                      'Balanced_Accuracy': (result['sensitivity'] + result['specificity']) / 2,
+                      'Youden_Index': result['youden_index'],
+                      **result['confusion_counts'], 'Target_Met': None,
+                      'Threshold_Role': 'fixed_threshold'}
+            sweep = pd.DataFrame([record])
+        record.update(Candidate_ID=i, C=params['svm__C'], Gamma=params['svm__gamma'])
+        candidate_rows.append(record)
+        sweeps.append(sweep)
+        if output is not None and save_all_sweeps:
+            directory = Path(output) / 'candidate_threshold_sweeps'
+            directory.mkdir(exist_ok=True)
+            sweep.to_csv(directory / f'candidate_{i:02d}.csv', index=False)
+    candidates = pd.DataFrame(candidate_rows)
+    if threshold_tuning:
+        eligible = candidates[candidates.Target_Met == True]
+        if not eligible.empty:
+            chosen = eligible.sort_values(
+                ['Sensitivity', 'Specificity', 'Candidate_ID'],
+                ascending=[False, False, True]).iloc[0]
+            selection_rule = 'max sensitivity satisfying both targets; ties: specificity, candidate order'
+        else:
+            chosen = candidates.sort_values(
+                ['Balanced_Accuracy', 'F1_FOG', 'Specificity', 'Candidate_ID'],
+                ascending=[False, False, False, True]).iloc[0]
+            selection_rule = 'targets unmet: best balanced accuracy; ties: F1, specificity, candidate order'
+    else:
+        chosen = candidates.sort_values(
+            ['F1_FOG', 'Specificity', 'Candidate_ID'],
+            ascending=[False, False, True]).iloc[0]
+        selection_rule = 'max pooled inner OOF F1 at fixed threshold; ties: specificity, candidate order'
+    chosen_id = int(chosen.Candidate_ID)
+    summary = {'candidate_id': chosen_id,
+               'C': float(chosen.C), 'gamma': chosen.Gamma,
+               'decision_threshold': float(chosen.Decision_Threshold),
+               'target_met': bool(chosen.Target_Met) if threshold_tuning else None,
+               'threshold_role': chosen.Threshold_Role,
+               'selection_rule': selection_rule,
+               'cv_folds': cv_folds, 'n_candidates': len(candidates),
+               'targets': {'min_sensitivity': min_sensitivity,
+                           'min_specificity': min_specificity} if threshold_tuning else None,
+               'threshold_method': threshold_method if threshold_tuning else 'fixed',
+               'inner_metrics_are_for_selection_only': True,
+               'score_scale_note': 'Each fold fits its own SVM; refitting may change score scale.'}
+    if output is not None:
+        candidates.to_csv(Path(output) / 'joint_candidates.csv', index=False)
+        sweeps[chosen_id - 1].to_csv(Path(output) / 'selected_candidate_threshold_sweep.csv', index=False)
+        pd.DataFrame(fold_rows).to_csv(Path(output) / 'inner_folds.csv', index=False)
+        _write_json(Path(output) / 'selected_parameters.json', summary)
+    return summary, all_scores[chosen_id - 1], fold_ids
+
+
+def _outer_metrics(y, prediction, scores=None):
+    result = diagnostic_metrics(y, prediction)
+    counts = result['confusion_counts']
+    n_positive = counts['TP'] + counts['FN']
+    both_classes = len(np.unique(y)) == 2
+    result.update(
+        fog_f1=float(f1_score(y, prediction, zero_division=0)) if n_positive else None,
+        balanced_accuracy=(result['sensitivity'] + result['specificity']) / 2 if both_classes else None,
+        roc_auc=float(roc_auc_score(y, scores)) if both_classes and scores is not None else None,
+        average_precision=float(average_precision_score(y, scores)) if both_classes and scores is not None else None,
+        confusion_matrix=confusion_matrix(y, prediction, labels=[0, 1]).tolist(),
+        confusion_matrix_order=['Non-FOG', 'FOG'])
+    return result
+
+
+def train_loso(paths, output, *, kernel='rbf', C=1., gamma='scale', seed=42,
+               tune=False, threshold_tuning=False, cv_folds=3, n_jobs=1,
+               cache_size=512., decision_threshold=0., min_sensitivity=.85,
+               min_specificity=.85, threshold_method='grid', threshold_min=-1.5,
+               threshold_max=.5, threshold_step=.02, C_grid=None, gamma_grid=None,
+               save_models=True, save_all_sweeps=False):
+    """LOSO outer test + ONE inner SGKF for joint parameter/threshold selection."""
+    _loso_options(kernel, C, gamma, cache_size, decision_threshold,
+                  min_sensitivity, min_specificity, n_jobs)
+    if threshold_tuning and decision_threshold != 0.:
+        raise ValueError('Không đặt threshold khác 0 cùng chế độ tự chọn ngưỡng.')
+    if not tune and (C_grid is not None or gamma_grid is not None):
+        raise ValueError('Grid C/gamma chỉ dùng khi --tune được bật.')
+    if save_all_sweeps and not (tune or threshold_tuning):
+        raise ValueError('--save-all-sweeps cần có chọn tham số/ngưỡng.')
+    output = Path(output)
+    if output.exists() and any(output.iterdir()):
+        raise ValueError('LOSO cần output mới/rỗng để tránh trộn các lượt đánh giá.')
+    data, names, config = load_datasets(paths)
+    X, y, groups = data['X'], data['y'], data['subject_id']
+    if len(np.unique(groups)) < 2 or len(np.unique(y)) != 2:
+        raise ValueError('LOSO cần >=2 bệnh nhân và cả hai lớp trong toàn dataset.')
+    outer_folds = list(LeaveOneGroupOut().split(X, y, groups))
+    needs_inner = tune or threshold_tuning
+    # Preflight every fold; fail loudly instead of silently dropping difficult patients.
+    for train_idx, test_idx in outer_folds:
+        if len(np.unique(y[train_idx])) != 2:
+            raise ValueError(f'LOSO test {groups[test_idx][0]}: nhóm train thiếu lớp.')
+        if needs_inner:
+            _group_folds(X[train_idx], y[train_idx], groups[train_idx], cv_folds, seed)
+    output.mkdir(parents=True, exist_ok=True)
+    _write_json(output / 'dataset_info.json', config)
+    _write_json(output / 'feature_names.json', names)
+    settings = {'evaluation': 'loso', 'trainer_version': TRAINER_VERSION,
+                'outer_folds': len(outer_folds), 'inner_cv': 'SGKF' if needs_inner else None,
+                'inner_cv_folds': cv_folds if needs_inner else None,
+                'cv_levels': 2 if needs_inner else 1,
+                'tune': bool(tune), 'threshold_tuning': bool(threshold_tuning),
+                'seed': seed, 'threshold_method': threshold_method,
+                'kernel': kernel, 'fixed_C': float(C), 'fixed_gamma': gamma,
+                'fixed_decision_threshold': float(decision_threshold),
+                'class_weight': 'balanced', 'cache_size': cache_size, 'n_jobs': n_jobs,
+                'versions': {'sklearn': sklearn.__version__, 'numpy': np.__version__, 'pandas': pd.__version__},
+                'fallback_policy': 'best inner balanced accuracy when both targets cannot be met',
+                'n_features': len(names), 'input_files': config['input_files'],
+                'C_grid': C_grid if C_grid is not None else [.1, 1., 10., 100.],
+                'gamma_grid': gamma_grid if gamma_grid is not None else ['scale', .01, .1],
+                'min_sensitivity': min_sensitivity, 'min_specificity': min_specificity,
+                'threshold_grid': {'min': threshold_min, 'max': threshold_max, 'step': threshold_step}}
+    _write_json(output / 'run_settings.json', settings)
+    _write_json(output / 'run_status.json', {'status': 'running', 'completed_subjects': []})
+    pipeline = Pipeline([('scaler', StandardScaler()),
+                         ('svm', SVC(kernel=kernel, C=C, gamma=gamma,
+                                     class_weight='balanced', probability=False,
+                                     cache_size=cache_size))])
+    subject_rows, predictions_all, fold_records, seen = [], [], [], np.zeros(len(y), dtype=int)
+    for fold, (train_idx, test_idx) in enumerate(outer_folds, 1):
+        subject = str(groups[test_idx][0])
+        print(f'LOSO {fold}/{len(outer_folds)}: TEST {subject}; '
+              f'TRAIN {", ".join(np.unique(groups[train_idx]))}', flush=True)
+        directory = output / f'fold_{fold:02d}_{subject}'
+        directory.mkdir()
+        manifest = _manifest(data, train_idx, test_idx)
+        manifest.to_csv(directory / 'split_manifest.csv', index=False)
+        if needs_inner:
+            selected, inner_scores, inner_ids = select_joint_parameters(
+                pipeline, X[train_idx], y[train_idx], groups[train_idx],
+                tune=tune, threshold_tuning=threshold_tuning, cv_folds=cv_folds,
+                seed=seed, kernel=kernel, decision_threshold=decision_threshold,
+                min_sensitivity=min_sensitivity, min_specificity=min_specificity,
+                threshold_method=threshold_method, threshold_min=threshold_min,
+                threshold_max=threshold_max, threshold_step=threshold_step,
+                C_grid=C_grid, gamma_grid=gamma_grid, n_jobs=n_jobs,
+                save_all_sweeps=save_all_sweeps, output=directory)
+            inner = manifest.iloc[train_idx].copy()
+            inner['Split'] = 'inner_validation_oof'
+            inner['Inner_Fold'] = inner_ids
+            inner['FOG_Decision_Score'] = inner_scores
+            inner['Decision_Threshold'] = selected['decision_threshold']
+            inner['Prediction'] = (inner_scores > selected['decision_threshold']).astype(np.int8)
+            inner.to_csv(directory / 'inner_validation_scores.csv', index=False)
+            _patient_metrics(y[train_idx], inner_scores, groups[train_idx], selected['decision_threshold']).to_csv(
+                directory / 'inner_patient_metrics.csv', index=False)
+        else:
+            selected = {'C': float(C), 'gamma': gamma,
+                        'decision_threshold': float(decision_threshold), 'target_met': None,
+                        'threshold_role': 'fixed_baseline', 'selection_rule': 'predeclared fixed parameters'}
+            _write_json(directory / 'selected_parameters.json', selected)
+        # One final fit on all outer-training subjects; no further tuning/CV.
+        model = clone(pipeline).set_params(svm__C=selected['C'], svm__gamma=selected['gamma'])
+        model.fit(X[train_idx], y[train_idx])
+        scores = model.decision_function(X[test_idx])
+        threshold = selected['decision_threshold']
+        predicted = (scores > threshold).astype(np.int8)
+        metrics = _outer_metrics(y[test_idx], predicted, scores)
+        metrics.update(status='completed', evaluation='LOSO outer test',
+                       trainer_version=TRAINER_VERSION, test_subject=subject,
+                       train_subjects=np.unique(groups[train_idx]).tolist(),
+                       test_subjects=[subject], train_windows=len(train_idx),
+                       test_windows=len(test_idx), n_features=len(names),
+                       decision_threshold=float(threshold), selected_parameters=selected,
+                       svm_parameters=model.named_steps['svm'].get_params(),
+                       support_vectors=model.named_steps['svm'].n_support_.tolist())
+        _write_json(directory / 'metrics.json', metrics)
+        pred_table = manifest.iloc[test_idx].copy()
+        pred_table['Dataset_Row'] = test_idx
+        pred_table['Outer_Fold'] = fold
+        pred_table['Prediction'] = predicted
+        pred_table['FOG_Decision_Score'] = scores
+        pred_table['Decision_Threshold'] = threshold
+        pred_table['C'] = selected['C']; pred_table['Gamma'] = selected['gamma']
+        pred_table['Threshold_Role'] = selected['threshold_role']
+        pred_table.to_csv(directory / 'test_predictions.csv', index=False)
+        predictions_all.append(pred_table); seen[test_idx] += 1
+        counts = metrics['confusion_counts']
+        subject_rows.append({
+            'Outer_Fold': fold, 'Subject_ID': subject,
+            'N_Windows': len(test_idx), 'N_FOG': int(np.sum(y[test_idx] == 1)),
+            **{k: metrics[k] for k in ['sensitivity', 'specificity', 'ppv', 'npv',
+                                        'accuracy', 'fog_f1', 'balanced_accuracy',
+                                        'youden_index', 'roc_auc', 'average_precision']},
+            **counts, 'C': selected['C'], 'Gamma': selected['gamma'],
+            'Decision_Threshold': threshold, 'Target_Met_Inner': selected['target_met'],
+            'Threshold_Role': selected['threshold_role']})
+        fold_records.append({'Outer_Fold': fold, 'Test_Subject': subject,
+                             'Train_Subjects': ','.join(np.unique(groups[train_idx])),
+                             'Train_Windows': len(train_idx), 'Test_Windows': len(test_idx)})
+        if save_models:
+            bundle = {'pipeline': model, 'feature_names': names,
+                      'label_mapping': {0: 'Non-FOG', 1: 'FOG'}, 'processing_config': config,
+                      'model_type': 'SVC', 'metrics': metrics,
+                      'train_subjects': metrics['train_subjects'], 'test_subjects': [subject],
+                      'decision_threshold': float(threshold), 'trainer_version': TRAINER_VERSION,
+                      'purpose': 'LOSO evaluation fold; not a model fitted on the full dataset'}
+            joblib.dump(bundle, directory / 'fog_svm.joblib')
+        _write_json(output / 'run_status.json', {'status': 'running',
+                    'completed_subjects': [row['Subject_ID'] for row in subject_rows]})
+    if not np.all(seen == 1):
+        raise ValueError('LOSO cần mỗi cửa sổ được test đúng một lần.')
+    joined = pd.concat(predictions_all, ignore_index=True).sort_values('Dataset_Row')
+    subjects = pd.DataFrame(subject_rows)
+    pooled = _outer_metrics(joined.Binary_Label.to_numpy(), joined.Prediction.to_numpy())
+    macro = {}
+    for key in ['sensitivity', 'specificity', 'ppv', 'npv', 'accuracy', 'fog_f1',
+                'balanced_accuracy', 'youden_index', 'roc_auc', 'average_precision']:
+        values = subjects[key].dropna().to_numpy(float)
+        macro[key] = {'mean': float(values.mean()) if len(values) else None,
+                      'std_sample': float(values.std(ddof=1)) if len(values) > 1 else None,
+                      'n_valid_subjects': len(values)}
+    summary = {'status': 'completed', 'evaluation': 'LOSO',
+               'trainer_version': TRAINER_VERSION, 'settings': settings,
+               'n_subjects': len(subjects), 'n_test_windows': len(joined),
+               'pooled_metrics': pooled, 'subject_macro_metrics': macro,
+               'target_met_inner_folds': int(sum(row['Target_Met_Inner'] is True for row in subject_rows)) if threshold_tuning else None,
+               'fallback_inner_folds': int(sum(row['Target_Met_Inner'] is False for row in subject_rows)) if threshold_tuning else None,
+               'notes': ['All subjects and windows are included in outer-test aggregation.',
+                         'Sensitivity/F1 for subjects with no actual FOG are null; undefined denominators are null.',
+                         'Pooled ROC-AUC/AP are intentionally null: raw score scales differ across outer models.',
+                         'Inner selection metrics are not independent performance estimates.',
+                         'LOSO folds are correlated; subject std is descriptive, not a confidence interval.',
+                         'No full-dataset deployment model is fitted by this evaluation.']}
+    joined.to_csv(output / 'loso_predictions.csv', index=False)
+    subjects.to_csv(output / 'loso_subject_metrics.csv', index=False)
+    pd.DataFrame(fold_records).to_csv(output / 'loso_fold_manifest.csv', index=False)
+    _write_json(output / 'loso_summary.json', summary)
+    _write_json(output / 'run_status.json', {'status': 'completed',
+                'completed_subjects': subjects.Subject_ID.tolist(), 'n_outer_folds': len(subjects)})
+    print(f'LOSO completed: {len(subjects)} subjects, {len(joined):,} outer-test windows.', flush=True)
+    return summary
+
+
 def _gamma(value):
     if value in ('scale', 'auto'):
         return value
@@ -753,45 +1094,77 @@ def _gamma(value):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--input', nargs='+', required=True, help='Feature CSV/NPZ files or directories; direct directory exports only')
+    parser.add_argument('--input', nargs='+', required=True, help='Feature CSV/NPZ files or directories')
     parser.add_argument('--output', default='svm_output')
+    parser.add_argument('--evaluation', choices=['holdout', 'loso'], default='holdout')
     parser.add_argument('--kernel', choices=['rbf', 'linear'], default='rbf')
     parser.add_argument('--C', '--c', dest='C', type=float, default=1.)
     parser.add_argument('--gamma', type=_gamma, default='scale')
-    parser.add_argument('--test-size', type=float, default=.25, help='Fraction of subjects held out, not fraction of windows')
-    parser.add_argument('--test-subjects', nargs='+', help='Explicit test subjects, e.g. S02 S08; overrides test-size')
+    parser.add_argument('--test-size', type=float, default=None, help='Hold-out only; default .25 of subjects')
+    parser.add_argument('--test-subjects', nargs='+', help='Hold-out only; explicit subjects')
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--tune', action='store_true', help='Tune C/gamma with grouped CV on training subjects only')
-    parser.add_argument('--cv-folds', type=int, default=3)
+    parser.add_argument('--tune', action='store_true', help='LOSO: test C/gamma candidates within ONE inner SGKF; holdout: existing GridSearch')
+    parser.add_argument('--cv-folds', type=int, default=3, help='LOSO inner SGKF fold count; holdout validation/GridSearch fold count')
     parser.add_argument('--n-jobs', type=int, default=1)
-    parser.add_argument('--cache-size', type=float, default=512., help='SVC cache in MiB per CV worker')
-    parser.add_argument('--decision-threshold', type=float, default=0., help='Fixed score threshold; FOG iff score > threshold')
-    parser.add_argument('--threshold-tuning', action='store_true', help='Choose score threshold using subject-grouped OOF validation; stop if targets unmet')
+    parser.add_argument('--cache-size', type=float, default=512.)
+    parser.add_argument('--decision-threshold', type=float, default=0., help='Fixed threshold; FOG iff score > threshold')
+    parser.add_argument('--threshold-tuning', action='store_true', help='LOSO: joint threshold selection with fallback; holdout: stop when targets unmet')
     parser.add_argument('--min-sensitivity', type=float, default=.85)
     parser.add_argument('--min-specificity', type=float, default=.85)
     parser.add_argument('--threshold-method', choices=['grid', 'exact'], default='grid')
     parser.add_argument('--threshold-min', type=float, default=-1.5)
     parser.add_argument('--threshold-max', type=float, default=.5)
     parser.add_argument('--threshold-step', type=float, default=.02)
-    parser.add_argument('--inner-cv-folds', type=int, default=3, help='Inner C/gamma CV folds when --tune and --threshold-tuning are combined')
+    parser.add_argument('--inner-cv-folds', type=int, default=None, help='Legacy holdout only; default 3. LOSO does not use a third CV level.')
+    parser.add_argument('--C-grid', nargs='+', type=float, default=None, help='LOSO --tune only; default .1 1 10 100')
+    parser.add_argument('--gamma-grid', nargs='+', type=_gamma, default=None, help='LOSO RBF --tune only; default scale .01 .1')
+    parser.add_argument('--no-save-models', action='store_true', help='LOSO only: omit per-fold joblib models')
+    parser.add_argument('--save-all-sweeps', action='store_true', help='LOSO: save threshold sweeps for every parameter candidate (can be large)')
     args = parser.parse_args()
     try:
+        if args.evaluation == 'loso':
+            if args.test_subjects is not None or args.test_size is not None:
+                raise ValueError('LOSO lần lượt test mọi bệnh nhân; không dùng --test-subjects/--test-size.')
+            if args.inner_cv_folds is not None:
+                raise ValueError('LOSO hai tầng chỉ dùng --cv-folds; bỏ --inner-cv-folds.')
+            if args.kernel == 'linear' and args.gamma_grid is not None:
+                raise ValueError('Gamma-grid chỉ có ý nghĩa với kernel RBF.')
+        elif (args.C_grid is not None or args.gamma_grid is not None
+              or args.no_save_models or args.save_all_sweeps):
+            raise ValueError('Grid tùy chỉnh và tùy chọn lưu model/sweep mới chỉ dùng trong LOSO.')
         paths = discover_inputs(args.input)
-        metrics = train(paths, args.output, args.test_size, args.seed, kernel=args.kernel, C=args.C,
-                        gamma=args.gamma, tune=args.tune, cv_folds=args.cv_folds,
-                        test_subjects=args.test_subjects, n_jobs=args.n_jobs, cache_size=args.cache_size,
-                        decision_threshold=args.decision_threshold, threshold_tuning=args.threshold_tuning,
-                        min_sensitivity=args.min_sensitivity, min_specificity=args.min_specificity,
-                        threshold_method=args.threshold_method, threshold_min=args.threshold_min,
-                        threshold_max=args.threshold_max, threshold_step=args.threshold_step,
-                        inner_cv_folds=args.inner_cv_folds)
+        common = dict(kernel=args.kernel, C=args.C, gamma=args.gamma, seed=args.seed,
+                      tune=args.tune, threshold_tuning=args.threshold_tuning,
+                      cv_folds=args.cv_folds, n_jobs=args.n_jobs, cache_size=args.cache_size,
+                      decision_threshold=args.decision_threshold,
+                      min_sensitivity=args.min_sensitivity, min_specificity=args.min_specificity,
+                      threshold_method=args.threshold_method, threshold_min=args.threshold_min,
+                      threshold_max=args.threshold_max, threshold_step=args.threshold_step)
+        if args.evaluation == 'loso':
+            metrics = train_loso(paths, args.output, **common,
+                                 C_grid=args.C_grid, gamma_grid=args.gamma_grid,
+                                 save_models=not args.no_save_models,
+                                 save_all_sweeps=args.save_all_sweeps)
+        else:
+            metrics = train(paths, args.output,
+                            test_size=.25 if args.test_size is None else args.test_size,
+                            test_subjects=args.test_subjects,
+                            inner_cv_folds=3 if args.inner_cv_folds is None else args.inner_cv_folds,
+                            **common)
     except (ValueError, KeyError, OSError) as exc:
         parser.exit(2, f'ERROR: {exc}\n')
+    if args.evaluation == 'loso':
+        print(json.dumps({'status': metrics['status'], 'n_subjects': metrics['n_subjects'],
+                          'pooled_metrics': metrics['pooled_metrics'],
+                          'subject_macro_metrics': metrics['subject_macro_metrics']},
+                         ensure_ascii=False, indent=2))
+        return
     if metrics.get('status') == 'target_not_met':
         print(json.dumps(metrics, ensure_ascii=False, indent=2))
         parser.exit(2, 'TARGET_NOT_MET: xem validation_threshold_sweep.csv; test chưa được đánh giá.\n')
-    print(json.dumps({key: metrics[key] for key in ['sensitivity', 'specificity', 'ppv', 'npv', 'accuracy', 'youden_index', 'balanced_accuracy', 'fog_f1',
-                                                   'roc_auc', 'average_precision', 'train_subjects', 'test_subjects']}, indent=2))
+    print(json.dumps({key: metrics[key] for key in ['sensitivity', 'specificity', 'ppv', 'npv',
+                        'accuracy', 'youden_index', 'balanced_accuracy', 'fog_f1',
+                        'roc_auc', 'average_precision', 'train_subjects', 'test_subjects']}, indent=2))
 
 
 if __name__ == '__main__':
