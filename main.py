@@ -1560,7 +1560,6 @@ class FOGSignalAnalyzer(QMainWindow):
                 plot.setTitle(title)
             for name in ['Mean', 'RMS', 'Std', 'Variance', 'Min', 'Max', 'SMA']:
                 self.time_feature_labels[name].setText(f'{name}: {proc_feat[name]:.6f} g' if name not in ['Variance'] else f'{name}: {proc_feat[name]:.6f} g²')
-            self.analysis_time_stats.setText(f"Processed features | Mean {proc_feat['Mean']:.6f} g | RMS {proc_feat['RMS']:.6f} g | Std {proc_feat['Std']:.6f} g | SMA {proc_feat['SMA']:.6f} g")
             self.analysis_status.setText(f"Window {wid} | {('FOG' if int(meta['Binary_Label']) else 'Non-FOG')} | {sensor} {axis} | Fs={fs:g} Hz | Raw + Preprocessed ready")
             self._plot_frequency_from_features(proc_feat, wid, meta, sensor, axis)
             self.update_publish_preview()

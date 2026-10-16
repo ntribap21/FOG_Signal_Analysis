@@ -309,10 +309,16 @@ class ProcessingEngine:
         if len(mag)>1: mag[0]*=0.5
         di=int(np.argmax(mag[1:])+1) if len(mag)>1 else 0
         dom=float(freq[di])
-        nperseg=min(256,n); noverlap=nperseg//2 if nperseg>=2 else 0
-        pf,pp=signal.welch(xc,fs=fs,window="hann",nperseg=nperseg,noverlap=noverlap,detrend=False,scaling="density")
+
+        nperseg=min(64,n);
+        noverlap = nperseg // 2 if nperseg >= 2 else 0
+        nfft = max(256, n);
+        pf,pp=signal.welch(
+            xc,fs=fs, window="hann",
+            nperseg=nperseg, noverlap=noverlap, nfft=nfft,
+            detrend=False, scaling="density")
         integ=lambda y,z: float(np.trapezoid(y,z) if hasattr(np,"trapezoid") else np.trapz(y,z)) if len(y)>1 else 0.0
-        total=integ(pp,pf); lm=(pf>=0.5)&(pf<=3.0); fm=(pf>3.0)&(pf<=8.0); loco=integ(pp[lm],pf[lm]); freeze=integ(pp[fm],pf[fm]); fi=freeze/loco if loco>0 else 0.0; low=loco/total if total>0 else 0.0
+        total=integ(pp,pf); lm=(pf>=0.5)&(pf<=3.0); fm=(pf>=-3.0)&(pf<=8.0); loco=integ(pp[lm],pf[lm]); freeze=integ(pp[fm],pf[fm]); fi=freeze/loco if loco>0 else 0.0; low=loco/total if total>0 else 0.0
         ps=pp/np.sum(pp) if np.sum(pp)>0 else pp; ps=ps[ps>0]; pse=float(-np.sum(ps*np.log2(ps))) if len(ps) else 0.0
         return {"Mean":mean,"RMS":rms,"Std":std,"Variance":var,"Min":mn,"Max":mx,"SMA":sma,"Dominant Frequency":dom,"Total Power":total,"Loco Power":loco,"Freeze Power":freeze,"Freeze Index":fi,"Low Freq Ratio":low,"PSE":pse,"FFT_Freq":freq,"FFT_Mag":mag,"PSD_Freq":pf,"PSD_Power":pp}
     def _all_feature_rows(self):
