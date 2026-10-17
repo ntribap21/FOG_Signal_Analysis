@@ -1,0 +1,8 @@
+{
+  "C": 1.0,
+  "gamma": "scale",
+  "decision_threshold": 0.0,
+  "target_met": null,
+  "threshold_role": "fixed_baseline",
+  "selection_rule": "predeclared fixed parameters"
+}

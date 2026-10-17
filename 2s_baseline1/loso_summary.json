@@ -1,0 +1,151 @@
+{
+  "status": "completed",
+  "evaluation": "LOSO",
+  "trainer_version": "fog-unified-1.1-loso-2level-1",
+  "settings": {
+    "evaluation": "loso",
+    "trainer_version": "fog-unified-1.1-loso-2level-1",
+    "outer_folds": 10,
+    "inner_cv": null,
+    "inner_cv_folds": null,
+    "cv_levels": 1,
+    "tune": false,
+    "threshold_tuning": false,
+    "seed": 42,
+    "threshold_method": "grid",
+    "kernel": "rbf",
+    "fixed_C": 1.0,
+    "fixed_gamma": "scale",
+    "fixed_decision_threshold": 0.0,
+    "class_weight": "balanced",
+    "cache_size": 512.0,
+    "n_jobs": 1,
+    "versions": {
+      "sklearn": "1.9.1",
+      "numpy": "2.5.2",
+      "pandas": "2.3.3"
+    },
+    "fallback_policy": "best inner balanced accuracy when both targets cannot be met",
+    "n_features": 126,
+    "input_files": [
+      "E:\\TEEP\\data_analysis_output_batch\\Batch_ALL\\window_2s_overlap_50%\\fog_batch.npz"
+    ],
+    "C_grid": [
+      0.1,
+      1.0,
+      10.0,
+      100.0
+    ],
+    "gamma_grid": [
+      "scale",
+      0.01,
+      0.1
+    ],
+    "min_sensitivity": 0.85,
+    "min_specificity": 0.85,
+    "threshold_grid": {
+      "min": -1.5,
+      "max": 0.5,
+      "step": 0.02
+    }
+  },
+  "n_subjects": 10,
+  "n_test_windows": 17059,
+  "pooled_metrics": {
+    "sensitivity": 0.601508120649652,
+    "specificity": 0.8834691881317248,
+    "ppv": 0.3672096317280453,
+    "npv": 0.9517386722866175,
+    "accuracy": 0.854973914062958,
+    "youden_index": 0.4849773087813767,
+    "confusion_counts": {
+      "TN": 13548,
+      "FP": 1787,
+      "FN": 687,
+      "TP": 1037
+    },
+    "positive_class": "FOG (1)",
+    "evaluation_unit": "window",
+    "undefined_metric_policy": "JSON null if denominator is zero; classification_report retains sklearn zero_division=0.",
+    "fog_f1": 0.45602462620932277,
+    "balanced_accuracy": 0.7424886543906883,
+    "roc_auc": null,
+    "average_precision": null,
+    "confusion_matrix": [
+      [
+        13548,
+        1787
+      ],
+      [
+        687,
+        1037
+      ]
+    ],
+    "confusion_matrix_order": [
+      "Non-FOG",
+      "FOG"
+    ]
+  },
+  "subject_macro_metrics": {
+    "sensitivity": {
+      "mean": 0.6167032749794852,
+      "std_sample": 0.22257441162497646,
+      "n_valid_subjects": 8
+    },
+    "specificity": {
+      "mean": 0.8677877378752269,
+      "std_sample": 0.12372588125653836,
+      "n_valid_subjects": 10
+    },
+    "ppv": {
+      "mean": 0.381288989944286,
+      "std_sample": 0.30939189298184905,
+      "n_valid_subjects": 10
+    },
+    "npv": {
+      "mean": 0.9419218894661711,
+      "std_sample": 0.058255201958408616,
+      "n_valid_subjects": 10
+    },
+    "accuracy": {
+      "mean": 0.8416670931807353,
+      "std_sample": 0.10978656347036737,
+      "n_valid_subjects": 10
+    },
+    "fog_f1": {
+      "mean": 0.46127629815221877,
+      "std_sample": 0.17419958824686307,
+      "n_valid_subjects": 8
+    },
+    "balanced_accuracy": {
+      "mean": 0.7315875883526313,
+      "std_sample": 0.08698035151100812,
+      "n_valid_subjects": 8
+    },
+    "youden_index": {
+      "mean": 0.46317517670526237,
+      "std_sample": 0.17396070302201622,
+      "n_valid_subjects": 8
+    },
+    "roc_auc": {
+      "mean": 0.8634886613786376,
+      "std_sample": 0.08442706629201385,
+      "n_valid_subjects": 8
+    },
+    "average_precision": {
+      "mean": 0.530255492685378,
+      "std_sample": 0.2184925096690131,
+      "n_valid_subjects": 8
+    }
+  },
+  "target_met_inner_folds": null,
+  "fallback_inner_folds": null,
+  "notes": [
+    "All subjects and windows are included in outer-test aggregation.",
+    "Sensitivity/F1 for subjects with no actual FOG are null; undefined denominators are null.",
+    "Pooled ROC-AUC/AP are intentionally null: raw score scales differ across outer models.",
+    "Inner selection metrics are not independent performance estimates.",
+    "LOSO folds are correlated; subject std is descriptive, not a confidence interval.",
+    "No full-dataset deployment model is fitted by this evaluation."
+  ]
+}

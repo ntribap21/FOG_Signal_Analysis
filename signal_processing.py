@@ -318,7 +318,16 @@ class ProcessingEngine:
             nperseg=nperseg, noverlap=noverlap, nfft=nfft,
             detrend=False, scaling="density")
         integ=lambda y,z: float(np.trapezoid(y,z) if hasattr(np,"trapezoid") else np.trapz(y,z)) if len(y)>1 else 0.0
-        total=integ(pp,pf); lm=(pf>=0.5)&(pf<=3.0); fm=(pf>3.0)&(pf<=8.0); loco=integ(pp[lm],pf[lm]); freeze=integ(pp[fm],pf[fm]); fi=freeze/loco if loco>0 else 0.0; low=loco/total if total>0 else 0.0
+        total=integ(pp,pf); 
+        lm=(pf >= 0.5) & (pf <= 3.0); 
+        fm=(pf >= 3.0) & (pf <= 8.0); 
+        
+        loco=integ(pp[lm],pf[lm]); 
+        freeze=integ(pp[fm],pf[fm]);
+        
+        fi=freeze/loco if loco>0 else 0.0; 
+        low=loco/total if total>0 else 0.0
+
         ps=pp/np.sum(pp) if np.sum(pp)>0 else pp; ps=ps[ps>0]; pse=float(-np.sum(ps*np.log2(ps))) if len(ps) else 0.0
         return {"Mean":mean,"RMS":rms,"Std":std,"Variance":var,"Min":mn,"Max":mx,"SMA":sma,"Dominant Frequency":dom,"Total Power":total,"Loco Power":loco,"Freeze Power":freeze,"Freeze Index":fi,"Low Freq Ratio":low,"PSE":pse,"FFT_Freq":freq,"FFT_Mag":mag,"PSD_Freq":pf,"PSD_Power":pp}
     def _all_feature_rows(self):
@@ -489,7 +498,20 @@ def _canonicalize_dict(config):
         if c['window_label_mode_combo'] not in ['Majority','FOG Threshold','Strict FOG']:raise ValueError('Quy tắc nhãn không hợp lệ.')
         result['feature_schema']='one-window-per-row'
     result['schema']='fog-unified-v1'
-    result['feature_version']='original14-unified-v1'
+    result['feature_version'] = 'original14-welch64-bandfix-v2'
+    result['spectral_settings'] = {
+        'method': 'welch',
+        'window': 'hann',
+        'nperseg_rule': 'min(64, n)',
+        'noverlap_rule': 'nperseg // 2',
+        'nfft_rule': 'max(256, n)',
+        'detrend': False,
+        'scaling': 'density',
+        'loco_band_hz': [0.5, 3.0],
+        'freeze_band_hz': [3.0, 8.0],
+        'band_power_method': 'trapezoid_including_endpoints',
+        'fi_zero_denominator_value': 0.0
+    }
     result['processing_order']=['selection','recording_exclusions','split_runs','resample','filter','detrend','windowing','features']
     effective=copy.deepcopy(result)
     if effective['selection']['mode']!=1:effective['selection'].update(start=None,end=None)

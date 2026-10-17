@@ -1,0 +1,86 @@
+{
+  "sensitivity": 0.7686567164179104,
+  "specificity": 0.9427402862985685,
+  "ppv": 0.7103448275862069,
+  "npv": 0.9570934256055363,
+  "accuracy": 0.915850144092219,
+  "youden_index": 0.7113970027164789,
+  "confusion_counts": {
+    "TN": 1383,
+    "FP": 84,
+    "FN": 62,
+    "TP": 206
+  },
+  "positive_class": "FOG (1)",
+  "evaluation_unit": "window",
+  "undefined_metric_policy": "JSON null if denominator is zero; classification_report retains sklearn zero_division=0.",
+  "fog_f1": 0.7383512544802867,
+  "balanced_accuracy": 0.8556985013582394,
+  "roc_auc": 0.952395486778785,
+  "average_precision": 0.780819711895527,
+  "confusion_matrix": [
+    [
+      1383,
+      84
+    ],
+    [
+      62,
+      206
+    ]
+  ],
+  "confusion_matrix_order": [
+    "Non-FOG",
+    "FOG"
+  ],
+  "status": "completed",
+  "evaluation": "LOSO outer test",
+  "trainer_version": "fog-unified-1.1-loso-2level-1",
+  "test_subject": "S09",
+  "train_subjects": [
+    "S01",
+    "S02",
+    "S03",
+    "S04",
+    "S05",
+    "S06",
+    "S07",
+    "S08",
+    "S10"
+  ],
+  "test_subjects": [
+    "S09"
+  ],
+  "train_windows": 15324,
+  "test_windows": 1735,
+  "n_features": 126,
+  "decision_threshold": 0.0,
+  "selected_parameters": {
+    "C": 1.0,
+    "gamma": "scale",
+    "decision_threshold": 0.0,
+    "target_met": null,
+    "threshold_role": "fixed_baseline",
+    "selection_rule": "predeclared fixed parameters"
+  },
+  "svm_parameters": {
+    "C": 1.0,
+    "break_ties": false,
+    "cache_size": 512.0,
+    "class_weight": "balanced",
+    "coef0": 0.0,
+    "decision_function_shape": "ovr",
+    "degree": 3,
+    "gamma": "scale",
+    "kernel": "rbf",
+    "max_iter": -1,
+    "probability": false,
+    "random_state": null,
+    "shrinking": true,
+    "tol": 0.001,
+    "verbose": false
+  },
+  "support_vectors": [
+    3982,
+    607
+  ]
+}
