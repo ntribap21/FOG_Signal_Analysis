@@ -1,7 +1,7 @@
 """FOG GUI: one processing pipeline; detect mixed modules before creating the GUI."""
 from pathlib import Path as _ReleasePath
 import importlib as _ReleaseImport
-RELEASE_VERSION = 'fog-unified-1.1'
+RELEASE_VERSION = 'fog-unified-1.2-no-dwt'
 
 def _load_matching_module(name):
     try:
@@ -392,6 +392,7 @@ from PySide6.QtWidgets import QTabWidget, QScrollArea, QLineEdit
 import copy
 from signal_processing import Config, ProcessingEngine, gui_read_raw, gui_labels, gui_split, gui_select, gui_process, gui_windows, gui_feature_rows, canonical_config, normalize_exclusions, merge_configs, recording_id
 from data_prepare import prepare_files, export_dataset, gui_export
+from feature_registry import GROUPS, DEFAULTS, options as feature_options, feature_names, axis_names, window_names
 
 class FOGSignalAnalyzer(QMainWindow):
     """Single GUI class; shared signal_processing owns the numerical pipeline."""
@@ -476,6 +477,7 @@ class FOGSignalAnalyzer(QMainWindow):
             return
         try:
             config = Config.from_dict(json.loads(path.read_text(encoding='utf-8')))
+            self._restore_feature_options('analysis',config)
             widgets = [getattr(self, name) for name in self.CONTROL_NAMES]
             widgets += [self.selection_mode, self.selection_start, self.selection_end, self.selection_exclude]
             # Validate first, avoiding silent widget clamping.
@@ -1561,6 +1563,7 @@ class FOGSignalAnalyzer(QMainWindow):
             for name in ['Mean', 'RMS', 'Std', 'Variance', 'Min', 'Max', 'SMA']:
                 self.time_feature_labels[name].setText(f'{name}: {proc_feat[name]:.6f} g' if name not in ['Variance'] else f'{name}: {proc_feat[name]:.6f} g²')
             self.analysis_status.setText(f"Window {wid} | {('FOG' if int(meta['Binary_Label']) else 'Non-FOG')} | {sensor} {axis} | Fs={fs:g} Hz | Raw + Preprocessed ready")
+            self._show_extra_features(proc_feat)
             self._plot_frequency_from_features(proc_feat, wid, meta, sensor, axis)
             self.update_publish_preview()
         except Exception as error:
@@ -1950,6 +1953,12 @@ class FOGSignalAnalyzer(QMainWindow):
             self.time_feature_labels[name] = lab
             fl.addWidget(lab, i // 4, i % 4)
         main.addWidget(feature_group)
+        self.extra_feature_table=QTableWidget(0,3)
+        self.extra_feature_table.setHorizontalHeaderLabels(['Additional feature','Value','Unit'])
+        self.extra_feature_table.setMaximumHeight(150)
+        self.extra_feature_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.extra_feature_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        main.addWidget(self.extra_feature_table)
         self.analysis_time_stats = QLabel('Select a window and press ANALYZE WINDOW.')
         self.analysis_time_stats.setStyleSheet('padding:2px;color:#555;')
         main.addWidget(self.analysis_time_stats)
@@ -2337,8 +2346,61 @@ class FOGSignalAnalyzer(QMainWindow):
         layout.addWidget(self.window_table, 1)
         return page
 
+    def _feature_panel(self, scope):
+        box=QGroupBox('ADDITIONAL FEATURES (optional)');layout=QGridLayout(box)
+        checks={};params={}
+        for i,(key,label) in enumerate(GROUPS.items()):
+            w=QCheckBox(label);checks[key]=w;layout.addWidget(w,i//2,i%2)
+            if scope=='analysis' and key in ('crosscorr','ater'):
+                w.setEnabled(False);w.setToolTip('Multi-position features: use Batch Configuration with all three axes.')
+            w.toggled.connect(lambda _=False, sc=scope: self._features_changed(sc))
+        offset=(len(GROUPS)+1)//2
+        for i,(key,default) in enumerate(DEFAULTS.items()):
+            if key=='entropy_m':
+                w=QSpinBox();w.setRange(1,3)
+            else:
+                w=QDoubleSpinBox();w.setDecimals(10 if key=='ater_epsilon_g2' else 3)
+                w.setRange(1e-10 if key=='ater_epsilon_g2' else .001,1. if key in ('entropy_r_ratio','crosscorr_max_s') else 10.)
+            w.setValue(default);params[key]=w
+            layout.addWidget(QLabel(key),offset+i,0);layout.addWidget(w,offset+i,1)
+            w.valueChanged.connect(lambda _=None,sc=scope:self._features_changed(sc))
+        setattr(self,scope+'_feature_checks',checks);setattr(self,scope+'_feature_params',params)
+        layout.addWidget(self._note('126 original features remain. Undefined extra statistics are NaN and imputed inside each training fold. Cross-correlation / ATER require Batch.'),offset+len(DEFAULTS),0,1,2)
+        return box
+
+    def _get_feature_options(self, scope):
+        checks=getattr(self,scope+'_feature_checks',{})
+        params=getattr(self,scope+'_feature_params',{})
+        return {**{k:w.isChecked() for k,w in checks.items()},**{k:w.value() for k,w in params.items()}}
+
+    def _restore_feature_options(self,scope,config):
+        v=feature_options(config)
+        for k,w in getattr(self,scope+'_feature_checks',{}).items():
+            w.blockSignals(True);w.setChecked(v[k] if w.isEnabled() else False);w.blockSignals(False)
+        for k,w in getattr(self,scope+'_feature_params',{}).items():
+            w.blockSignals(True);w.setValue(v[k]);w.blockSignals(False)
+
+    def _features_changed(self,scope):
+        if scope=='batch':
+            if hasattr(self,'batch_summary'):self._batch_changed()
+            return
+        if hasattr(self,'windowing_applied'):
+            self.windowing_applied=False;self.window_config=None
+        if hasattr(self,'publish_info'):self.publish_info.setText('Feature settings changed: APPLY WINDOWING again, then preview/export.')
+        if hasattr(self,'extra_feature_table'):self.extra_feature_table.setRowCount(0)
+
+    def _show_extra_features(self,values):
+        if not hasattr(self,'extra_feature_table'):return
+        keys=[k for k in values if k not in GUI_FEATURES and not k.startswith(('FFT_','PSD_'))]
+        self.extra_feature_table.setRowCount(len(keys))
+        for row,key in enumerate(keys):
+            value=values[key];unit='g/s' if key=='Jerk RMS' else 's' if key=='Autocorr Lag s' else 'dimensionless'
+            for col,text in enumerate([key, f'{value:.6g}' if np.isfinite(value) else 'undefined (train-fold imputation)',unit]):
+                self.extra_feature_table.setItem(row,col,QTableWidgetItem(text))
+
     def _create_export_page(self):
         page, layout = self._heading_page('EXPORT FEATURES')
+        layout.addWidget(self._feature_panel('analysis'))
         row = QHBoxLayout()
         self.export_format = QComboBox()
         self.export_format.addItems(['CSV + NPZ', 'NPZ', 'CSV'])
@@ -2442,6 +2504,7 @@ class FOGSignalAnalyzer(QMainWindow):
             cg.setColumnStretch(column, 1)
         bl.addWidget(pre)
         bl.addWidget(win)
+        bl.addWidget(self._feature_panel('batch'))
         row = QHBoxLayout()
         for title, slot in [('COPY ANALYSIS SETTINGS', self._copy_analysis_to_batch), ('SAVE BATCH CONFIG', self._save_batch_config), ('LOAD / MERGE CONFIGS', self._load_batch_configs)]:
             row.addWidget(self._button(title, slot))
@@ -2713,7 +2776,7 @@ class FOGSignalAnalyzer(QMainWindow):
 
     def _install_export_preview(self, table):
         self.export_model.set_dataframe(table)
-        self.publish_info.setText(f'{len(table):,} preview rows · 14 features/trục · export ghép thành một hàng/cửa sổ')
+        self.publish_info.setText(f'{len(table):,} preview rows · {len(feature_names(self.window_config or self.capture_config()))} features/window · xem cột mới trong bảng')
 
     def save_config(self):
         path, _ = QFileDialog.getSaveFileName(self, 'Save current configuration', 'fog_config.json', 'JSON (*.json)')
@@ -2732,6 +2795,7 @@ class FOGSignalAnalyzer(QMainWindow):
             return
         try:
             config = Config.from_dict(json.loads(Path(path).read_text(encoding='utf-8')))
+            self._restore_feature_options('analysis',config)
             if config.get('schema') not in ('original-core-gui-v1','fog-unified-v1'):
                 raise ValueError('JSON không thuộc phiên bản GUI dùng core gốc này.')
             for name in self.CONTROL_NAMES:
@@ -2901,7 +2965,7 @@ class FOGSignalAnalyzer(QMainWindow):
         controls['windowing_sensor_combo'] = sensors[0] if sensors else 'Ankle'
         for axis, key in zip(GUI_AXES, ['windowing_axis_x_checkbox', 'windowing_axis_y_checkbox', 'windowing_axis_z_checkbox']):
             controls[key] = axis in axes
-        return canonical_config(dict(schema='original-core-gui-v1', source_fs=64.0, feature_schema='one-window-per-row', sensors=sensors, axes=axes, selection=dict(mode=self.batch_scope.currentIndex(), start=self.batch_start.value(), end=self.batch_end.value(), exclude_zero=self.batch_exclude_zero.isChecked()), controls=controls, excluded_regions=copy.deepcopy(self.excluded_regions), filter_implementation='original filtfilt; lfilter fallback on short segments', label_mapping={'0': None, '1': 0, '2': 1}, processing_order=['selection', 'recording_exclusions', 'split_runs', 'resample', 'filter', 'detrend', 'windowing', 'features']))
+        return canonical_config(dict(schema='original-core-gui-v1', source_fs=64.0, feature_schema='one-window-per-row', sensors=sensors, axes=axes, selection=dict(mode=self.batch_scope.currentIndex(), start=self.batch_start.value(), end=self.batch_end.value(), exclude_zero=self.batch_exclude_zero.isChecked()), controls=controls, feature_options=self._get_feature_options('batch'), excluded_regions=copy.deepcopy(self.excluded_regions), filter_implementation='original filtfilt; lfilter fallback on short segments', label_mapping={'0': None, '1': 0, '2': 1}, processing_order=['selection', 'recording_exclusions', 'split_runs', 'resample', 'filter', 'detrend', 'windowing', 'features']))
 
     def _batch_changed(self, *args):
         if not hasattr(self, 'batch_summary'):
@@ -2916,12 +2980,13 @@ class FOGSignalAnalyzer(QMainWindow):
         try:
             c = self.capture_batch_config()
             v = c['controls']
-            n = len(c['sensors']) * len(c['axes']) * 14
+            n = len(feature_names(c))
             self.batch_summary.setText(f"{len(self.batch_files)} files · {', '.join(c['sensors'])} · {', '.join(c['axes'])} · {n} features/window · Window {v['window_length_spinbox']:g}s · Overlap {v['window_overlap_spinbox']:g}% · {sum((len(r) for r in self.excluded_regions.values()))} exclusion regions")
         except Exception as exc:
             self.batch_summary.setText('CONFIG: ' + str(exc))
 
     def _copy_analysis_to_batch(self):
+        self._restore_feature_options('batch',{'feature_options':self._get_feature_options('analysis')})
         if not hasattr(self, 'resample_checkbox'):
             return
         for name, w in self.batch_controls.items():
@@ -2946,6 +3011,7 @@ class FOGSignalAnalyzer(QMainWindow):
 
     def _set_batch_config(self, config):
         config = canonical_config(config)
+        self._restore_feature_options('batch',config)
         if config.get('schema') not in ('original-core-gui-v1','fog-unified-v1'):
             raise ValueError('Batch GUI này cần config original-core-gui-v1.')
         for name, w in self.batch_controls.items():
@@ -3152,6 +3218,7 @@ class FOGSignalAnalyzer(QMainWindow):
             widget = getattr(self, name)
             controls[name] = widget.isChecked() if isinstance(widget, QCheckBox) else widget.currentText() if isinstance(widget, QComboBox) else widget.value()
         config = {'schema': 'original-core-gui-v1', 'source_fs': 64.0, 'feature_schema': 'one-window-sensor-axis-per-row', 'selection': {'mode': self.selection_mode.currentIndex(), 'start': self.selection_start.value(), 'end': self.selection_end.value(), 'exclude_zero': self.selection_exclude.isChecked()}, 'controls': controls, 'filter_implementation': 'original filtfilt; lfilter fallback on short segments', 'label_mapping': {'0': None, '1': 0, '2': 1}, 'processing_order': ['selection', 'resample', 'filter', 'detrend', 'windowing']}
+        config['feature_options']=self._get_feature_options('analysis')
         config = Config.from_dict(config)
         return config
 

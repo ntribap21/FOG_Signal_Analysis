@@ -4,8 +4,8 @@ import ast
 import importlib
 import sys
 
-EXPECTED='fog-unified-1.1'
-FILES=['main.py','signal_processing.py','data_prepare.py','batch_processing.py','train_fog.py']
+EXPECTED='fog-unified-1.2-no-dwt'
+FILES=['feature_registry.py','main.py','signal_processing.py','data_prepare.py','batch_processing.py','train_fog.py']
 
 def main():
     root=Path(__file__).resolve().parent
@@ -21,7 +21,7 @@ def main():
     if errors:
         print('\n'.join(errors));return 1
     sys.path.insert(0,str(root))
-    for name in ['signal_processing','data_prepare','batch_processing','train_fog','main']:
+    for name in ['feature_registry','signal_processing','data_prepare','batch_processing','train_fog','main']:
         try:
             module=importlib.import_module(name)
             if Path(module.__file__).resolve().parent!=root:raise ValueError('Nạp module từ thư mục khác: '+str(module.__file__))

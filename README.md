@@ -1,74 +1,90 @@
-# FOG_FIXED — một bộ đồng bộ, fog-unified-1.1
+# FOG Analyzer — bổ sung đặc trưng, không DWT
 
-## Cài đặt trên Windows
+Đây là bộ file đồng bộ dựa trên sáu file người dùng cung cấp. Giữ 14 công thức cũ/trục và pipeline selection → split → filter → detrend → windowing. Không có DWT, PyWavelets, gravity compensation hoặc nhánh LPMean trong bản này.
 
-1. Giải nén toàn bộ ZIP vào cùng một thư mục. File Python phải có đúng tên:
-   main.py, signal_processing.py, data_prepare.py, batch_processing.py, train_fog.py.
-   Không để các tên main(9).py / signal_processing(1).py thay cho tên module chuẩn.
-2. Giữ file fog_config.json đang dùng và raw TXT/model/output của bạn.
-   ZIP không chứa fog_config.json nên không ghi đè cấu hình cá nhân.
-3. Trong PowerShell ở thư mục chương trình, với .venv đang kích hoạt:
+## Cài và chạy trên Windows
+
+Giải nén toàn bộ vào một thư mục mới. Tên chạy phải là `main.py`, `signal_processing.py`, `data_prepare.py`, `train_fog.py`, `batch_processing.py`, `check_install.py`, `feature_registry.py`. Không trộn module bản trước.
 
 ```powershell
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 python check_install.py
 python main.py
 ```
 
-Nếu chưa có fog_config.json và muốn dùng cấu hình bạn đã cung cấp trước đây:
+Không cần tạo lại venv nếu đang có môi trường phù hợp. Lệnh pip trên không yêu cầu nâng cấp đồng loạt các thư viện đã cài.
+
+## Thao tác GUI
+
+- Mục EXPORT FEATURES có panel ADDITIONAL FEATURES cho phân tích một cảm biến. Tắt toàn bộ checkbox mới để dùng bộ gốc.
+- Trong Batch Configuration có panel riêng. Chọn sensor/trục, preprocessing và windowing như trước, rồi chọn feature mới.
+- Chọn cross-correlation: cần ít nhất hai vị trí, đủ ba trục. Chọn ATER: cần Ankle và Trunk, đủ ba trục. Hai nhóm này chỉ có trong Batch GUI vì cửa sổ tương tác hiện chỉ giữ một sensor.
+- Các feature từng trục mới hiển thị trong bảng Additional feature của trang time analysis sau ANALYZE WINDOW. Feature liên kênh hiển thị qua batch CSV/NPZ.
+- Khi thay feature tương tác, phải APPLY WINDOWING lại trước preview/export. Thay Batch feature không thay lựa chọn phân tích một cảm biến.
+- Lưu/đọc config JSON lưu cả nhóm đang bật và tham số. Config cũ không có feature_options sẽ dùng 14 đặc trưng cũ/trục.
+- Cross-correlation/ATER thiếu sensor gây lỗi cấu hình, không tạo số 0 giả. Report giữ thống kê bản ghi và thêm Feature_Count, Undefined_Feature_Values khi xuất batch.
+
+## Các đặc trưng mới
+
+Giữ 126 đặc trưng gốc khi đủ 9 trục. Mặc định tất cả nhóm mới tắt.
+
+| Nhóm | Định nghĩa | Số cột thêm đủ 3 sensor/3 trục |
+|---|---|---:|
+| Jerk | RMS(diff(a) × fs), gia tốc processed, đơn vị g/s | 9 |
+| SampEn | m=2, r=0.2×SD mặc định; cùng tập template độ dài m và m+1; không self-match; natural log | 9 |
+| ApEn | Có self-match; phi(m) − phi(m+1); natural log | 9 |
+| Autocorrelation | Trừ mean; R(k)/R(0); maximum trong lag, không phải tìm local peak; peak và lag giây | 18 |
+| Kurtosis | Fisher excess, scipy bias=False | 9 |
+| Crest Factor | max(abs(a−mean))/RMS(a−mean), không đơn vị | 9 |
+| Correlation | Pearson lag 0: F–V, F–L, V–L tại mỗi sensor | 9 |
+| Cross-correlation | Chuẩn hóa Pearson trên phần chồng lấp, magnitude của XYZ sau trừ mean từng trục; lấy hệ số có abs lớn nhất và lag | 6 |
+| LogATER | log((sum XYZ band power ankle + eps)/(sum XYZ band power trunk + eps)); loco 0.5–3 và freeze 3–8 Hz | 2 |
+
+Bật tất cả: **206 cột** đầu vào. Đây là số feature xuất, chưa bao gồm cột indicator do imputer tạo nội bộ khi có giá trị thiếu.
+
+Các thông số có thể đổi ở panel và config:
+
+- entropy_m=2, entropy_r_ratio=0.2; delay cố định 1 mẫu.
+- autocorr_min_s=0.35, autocorr_max_s=1.0; ceil/floor theo fs; giới hạn lag ≤ n//2 để còn ít nhất nửa cửa sổ chồng lấp.
+- crosscorr_max_s=0.25; k>0 nghĩa ghép sensor A[n] với B[n+k]. Đây là quy ước index, không khẳng định hướng truyền chuyển động. Nếu nhiều lag hòa, chọn lag đầu tiên theo thứ tự tăng dần.
+- ater_epsilon_g2=1e-8; là tham số ổn định, không phải ngưỡng năng lượng đã được xác thực. Giữ các band power gốc để phát hiện cả tử/mẫu nhỏ.
+
+Correlation giữa vị trí sử dụng norm của vector đã trừ mean theo trục, không dùng norm raw chứa trọng lực và không tương đương gravity compensation. Dữ liệu đầu vào các hàm này đã là g; tên khóa Signals vẫn giữ hậu tố `_mg` từ hệ thống cũ.
+
+## Trường hợp không tính được
+
+Tín hiệu đầu vào có NaN/Inf hoặc sai chiều bị từ chối; không xóa mẫu riêng từng trục. Các thống kê bổ sung không xác định (SampEn không có cặp m/m+1 khớp; variance gần 0 cho entropy/correlation/kurtosis/crest; lag không đủ) xuất NaN. Giá trị thiếu không bị thay bằng 0 khi trích xuất.
+
+Trainer mới dùng `SimpleImputer(median, add_indicator=True, keep_empty_features=True) → StandardScaler → SVC`. Imputer/scaler được fit trong từng fold train, kể cả inner folds. Feature hoàn toàn thiếu trong tập train được impute 0 theo keep_empty_features; model lưu cả pipeline và thứ tự đầu vào. Xem tỷ lệ thiếu trước khi diễn giải kết quả: batch có quá nhiều thiếu cần xem lại cấu hình hoặc feature.
+
+Không dùng NaN để che lỗi raw. Raw lỗi và thống kê không ước lượng được là hai tình huống khác nhau. Các feature cũ phải tiếp tục hữu hạn.
+
+## Export và training
+
+NPZ giữ feature_names theo thứ tự. CSV mở rộng phải có file `<prefix>_config.json` đi kèm. Long CSV mở rộng không được trainer chấp nhận; xuất wide qua GUI mới hoặc batch. Không sửa JSON sau khi xuất để đổi nội dung NPZ.
 
 ```powershell
-Copy-Item fog_config_example.json fog_config.json
+python train_fog.py --input fog_batch.npz --output results_no_dwt_B1 --evaluation loso --C 1 --gamma scale --decision-threshold 0
+python train_fog.py --input fog_batch.npz --output results_no_dwt_B2 --evaluation loso --threshold-tuning --threshold-method exact --cv-folds 3
+python train_fog.py --input fog_batch.npz --output results_no_dwt_B3 --evaluation loso --tune --threshold-tuning --threshold-method exact --cv-folds 3
 ```
 
-Chỉ thực hiện lệnh copy khi chưa có cấu hình cá nhân cần giữ.
-Ví dụ giữ: Fs 64, resample 64→64, Low-pass 16 Hz order 4, detrend Linear,
-window 2 s, overlap 50%, Majority, Ankle ba trục, loại label gốc 0.
+Mỗi lần dùng một NPZ hoặc một CSV, không nhập cả hai bản sao cùng dataset. Model cũ không dùng cho feature mới. Xuất batch và train lại khi thay feature. So sánh A0 tất cả nhóm mới tắt với A1 chỉ Jerk, A2 chỉ SampEn, A3 chỉ autocorrelation, A4 chỉ correlation... trước khi kết hợp. Giữ dữ liệu, khoảng loại, filter, window, label và ngưỡng cố định khi so nhóm.
 
-## Những lỗi được xử lý
+## Kiểm tra đã thực hiện / giới hạn
 
-- API mismatch: signal_processing cung cấp Config, ProcessingEngine và các hàm GUI/batch cần dùng.
-- Một pipeline numerical duy nhất trong signal_processing; data_prepare chỉ điều phối/export.
-- Một lớp FOGSignalAnalyzer kế thừa QMainWindow; không có CoreFOGAnalyzer/_PreviousFOGAnalyzer.
-- Config được chuẩn hóa tại mọi ranh giới xử lý; không trộn dict/dataclass gây .validate() crash.
-- Version check khi mở main và check_install phát hiện module khác phiên bản trước khi chạy GUI.
-- batch_processing chỉ chuyển tiếp import tới signal_processing, không chứa công thức riêng.
+- So sánh trực tiếp 14 công thức và config chế độ gốc với signal_processing(4).py: không đổi trong kiểm tra đối chứng.
+- Kiểm tra cú pháp các module.
+- Dữ liệu tổng hợp: batch → CSV/NPZ → loader trainer giữ đúng 206 tên và giá trị.
+- Export GUI qua hàm xử lý → wide cho cùng dữ liệu khớp batch, kể cả feature liên kênh.
+- Kiểm tra tín hiệu hằng, sin, correlation, autocorrelation, missing-value fit/inference.
+- Chạy LOSO 4 bệnh nhân tổng hợp thành công, không phải kết quả hiệu năng DAPHNET.
+- Chưa chạy mở GUI thực tế vì môi trường kiểm tra không có PySide6/pyqtgraph. Cần chạy check_install và mở thử trên máy Windows; kích thước panel mới có thể cần điều chỉnh theo màn hình thực tế.
 
-## Các đặc tính giữ nguyên
-
-- Phương pháp numerical của main/batch bạn gửi: Butterworth b/a, filtfilt,
-  lfilter fallback cho đoạn ngắn, resample và detrend như trước.
-- 14 loại đặc trưng gốc, công thức FI và cách gán nhãn gốc.
-- SVM StandardScaler + SVC, cách chia theo bệnh nhân và các tham số train hiện có.
-- JSON GUI original-core-gui-v1 được chuyển về Config chung mà giữ nguyên controls/selection.
-- Pan/zoom, Original/Binary labels, Data Selection và Selected Time Domain.
-- Loại trừ theo Recording_ID, bật/tắt/xóa từng đoạn; không windowing qua đoạn bị loại.
-- Batch config độc lập, 1–3 vị trí và 1–3 trục; input folder hoặc nhiều TXT.
-
-JSON flat của nhánh SOS/modular cũ không được âm thầm sử dụng cho thuật toán gốc.
-Nếu nạp nhầm schema, chương trình báo rõ; không tự thay thuật toán/đặc trưng.
-File signal_processing(1).py bạn gửi dùng nhánh SOS khác với main/batch; bản này
-chọn công thức main/batch làm chuẩn để giữ kết quả của bộ 42 đặc trưng đã kiểm tra.
-
-## Xuất dữ liệu
-
-NPZ/CSV có một hàng/cửa sổ, metadata bệnh nhân/bản ghi/segment/time/config.
-Preview GUI có thể hiển thị hàng riêng cho từng trục; khi export được ghép về một vector/cửa sổ.
-Ankle × ba trục: 42 cột; hai vị trí × ba trục: 84; ba vị trí × ba trục: 126.
-Xuất kèm config JSON và report từng file. Không đưa đồng thời CSV và NPZ của cùng dataset vào train.
+Chạy lại smoke test số học/export/train không cần GUI:
 
 ```powershell
-python data_prepare.py --input raw_folder --config fog_config.json --output output/fog_batch --format both
-python train_fog.py --input output/fog_batch.npz --output svm_output
+python smoke_test.py
 ```
 
-## Kiểm tra
-
-- Biên dịch Python và check_install trong thư mục giải nén độc lập.
-- GUI offscreen, cấu hình tự nạp, Data Selection/exclusions/preprocessing/windowing.
-- Export Current Windows và prepare_batch được gọi thực tế.
-- Bộ Ankle trên đoạn S09R01 khớp numerical main/batch gốc.
-- GUI và batch cùng input/config có cùng đặc trưng; xuất 42/84/126 cột; bộ train đọc được.
-- Các thông số controls/selection trong cấu hình gốc được giữ nguyên.
-
-Lần sửa này không thêm Jerk/CWT, không thay mục tiêu tuning hoặc ngưỡng quyết định SVM.
+SampEn/ApEn là tính toán bậc hai theo số mẫu; bật cả hai trên toàn bộ DAPHNET sẽ chậm hơn đáng kể. Thử một bản ghi trước. Không có khẳng định feature mới sẽ tăng đồng thời sensitivity/specificity/F1.

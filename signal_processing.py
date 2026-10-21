@@ -1,5 +1,5 @@
 """Single numerical pipeline shared by GUI, batch and CLI. Original formulas preserved."""
-RELEASE_VERSION = 'fog-unified-1.1'
+RELEASE_VERSION = 'fog-unified-1.2-no-dwt'
 import copy
 import hashlib
 import json
@@ -9,6 +9,7 @@ from fractions import Fraction
 import numpy as np
 import pandas as pd
 from scipy import signal
+from feature_registry import BASE, GROUPS, options, axis_names, window_names, feature_names, axis_extra, window_extra
 PIPELINE_VERSION = 'original14-unified-v1'
 GUI_SENSORS = ('Ankle','Thigh','Trunk')
 GUI_AXES = ('Forward','Vertical','Lateral')
@@ -18,8 +19,10 @@ class FrozenControl:
     def value(self): return self._value
     def currentText(self): return self._value
     def isChecked(self): return bool(self._value)
+    
 class ProcessingEngine:
     def __init__(self,config):
+        self.feature_config = config
         for name,value in config['controls'].items(): setattr(self,name,FrozenControl(value))
 
     def get_sensor_columns(self):
@@ -301,7 +304,8 @@ class ProcessingEngine:
 
         return label, fog_ratio
     def _compute_features(self,x,fs):
-        x=np.asarray(x,dtype=float); x=x[np.isfinite(x)]
+        x=np.asarray(x,dtype=float)
+        if x.ndim != 1 or not np.isfinite(x).all(): raise ValueError("Signal chứa NaN/Inf; không xóa mẫu riêng từng trục.")
         if len(x)<2: raise ValueError("Window phải có ít nhất 2 sample.")
         mean=float(np.mean(x)); rms=float(np.sqrt(np.mean(x*x))); std=float(np.std(x)); var=float(np.var(x)); mn=float(np.min(x)); mx=float(np.max(x)); sma=float(np.mean(np.abs(x)))
         xc=x-mean; n=len(xc)
@@ -329,21 +333,28 @@ class ProcessingEngine:
         low=loco/total if total>0 else 0.0
 
         ps=pp/np.sum(pp) if np.sum(pp)>0 else pp; ps=ps[ps>0]; pse=float(-np.sum(ps*np.log2(ps))) if len(ps) else 0.0
-        return {"Mean":mean,"RMS":rms,"Std":std,"Variance":var,"Min":mn,"Max":mx,"SMA":sma,"Dominant Frequency":dom,"Total Power":total,"Loco Power":loco,"Freeze Power":freeze,"Freeze Index":fi,"Low Freq Ratio":low,"PSE":pse,"FFT_Freq":freq,"FFT_Mag":mag,"PSD_Freq":pf,"PSD_Power":pp}
+        result = {"Mean":mean,"RMS":rms,"Std":std,"Variance":var,"Min":mn,"Max":mx,"SMA":sma,"Dominant Frequency":dom,"Total Power":total,"Loco Power":loco,"Freeze Power":freeze,"Freeze Index":fi,"Low Freq Ratio":low,"PSE":pse,"FFT_Freq":freq,"FFT_Mag":mag,"PSD_Freq":pf,"PSD_Power":pp}
+        result.update({k.replace("_", " "): v for k,v in axis_extra(x,fs,getattr(self,"feature_config",{})).items()})
+        return result
     def _all_feature_rows(self):
         if not self.windowing_applied or not self.window_metadata or not self.window_signal_data:
             raise ValueError("Hãy APPLY WINDOWING trước khi Publish.")
-        fs=float(self.windowing_sampling_rate)
-        rows=[]
-        cols_by_sensor={"Ankle":["Ankle_Forward_mg","Ankle_Vertical_mg","Ankle_Lateral_mg"],"Thigh":["Thigh_Forward_mg","Thigh_Vertical_mg","Thigh_Lateral_mg"],"Trunk":["Trunk_Forward_mg","Trunk_Vertical_mg","Trunk_Lateral_mg"]}
+        config=self.feature_config;fs=float(self.windowing_sampling_rate);rows=[]
         for item,meta in zip(self.window_signal_data,self.window_metadata):
-            for sensor,cols in cols_by_sensor.items():
-                for axis,col in zip(["X","Y","Z"],cols):
-                    if col not in item["Signals"]: continue
-                    f=self._compute_features(np.asarray(item["Signals"][col],float),fs)
-                    row={"Window_ID":int(meta["Window_ID"]),"Segment_ID":int(meta["Segment_ID"]),"Sensor":sensor,"Axis":axis,"Start_Time":float(meta["Start_Time"]),"End_Time":float(meta["End_Time"]),"Binary_Label":int(meta["Binary_Label"]),"FOG_Ratio":float(meta["FOG_Ratio"])}
-                    for k in ["Mean","RMS","Std","Variance","Min","Max","SMA","Dominant Frequency","Total Power","Loco Power","Freeze Power","Freeze Index","Low Freq Ratio","PSE"]: row[k.replace(" ","_")]=f[k]
-                    rows.append(row)
+            values={}
+            for sensor in config['sensors']:
+                for axis in config['axes']:
+                    col=f'{sensor}_{axis}_mg'
+                    if col not in item['Signals']: raise ValueError('Thiếu tín hiệu: '+col)
+                    f=self._compute_features(item['Signals'][col],fs)
+                    values[(sensor,axis)]={k: f[k.replace('_',' ')] for k in axis_names(config)}
+            shared=window_extra(item['Signals'],fs,config,values)
+            for (sensor,axis),f in values.items():
+                row=dict(Window_ID=int(meta['Window_ID']),Segment_ID=int(meta['Segment_ID']),
+                         Sensor=sensor,Axis=dict(zip(GUI_AXES,['X','Y','Z']))[axis],
+                         Start_Time=float(meta['Start_Time']),End_Time=float(meta['End_Time']),
+                         Binary_Label=int(meta['Binary_Label']),FOG_Ratio=float(meta['FOG_Ratio']))
+                row.update(f);row.update(shared);rows.append(row)
         return pd.DataFrame(rows)
 
 def gui_read_raw(path):
@@ -499,6 +510,15 @@ def _canonicalize_dict(config):
         result['feature_schema']='one-window-per-row'
     result['schema']='fog-unified-v1'
     result['feature_version'] = 'original14-welch64-bandfix-v2'
+    fo=options(result)
+    if any(fo[k] for k in GROUPS):
+        result['feature_options']=fo
+        result['feature_version']='extended-no-dwt-v1'
+        result['feature_names']=feature_names(result)
+        result['undefined_feature_policy']='nan; train-fold median imputation with indicators; empty features -> 0'
+    else:
+        for key in ['feature_options','feature_names','undefined_feature_policy']: result.pop(key,None)
+
     result['spectral_settings'] = {
         'method': 'welch',
         'window': 'hann',
@@ -577,15 +597,17 @@ def prepare_recording(path,config):
         else:
             if channel_meta!=meta:raise ValueError('Cửa sổ giữa các vị trí không đồng bộ.')
             for item,new in zip(items,channel_items):item['Signals'].update(new['Signals'])
-    engine=ProcessingEngine(local);rows=[];names=[]
+    engine=ProcessingEngine(local);rows=[];names=feature_names(config)
     for item,m in zip(items,meta):
         row=dict(Subject_ID=re.match(r'S\d+',rid).group(),Recording_ID=rid,Segment_ID=m['Segment_ID'],Window_ID=m['Window_ID'],Start_Time=m['Start_Time'],End_Time=m['End_Time'],Label=m['Binary_Label'],FOG_Ratio=m['FOG_Ratio'],Config_ID=config['config_id'])
+        channel_values={}
         for sensor in config['sensors']:
             for axis in config['axes']:
                 values=engine._compute_features(item['Signals'][f'{sensor}_{axis}_mg'],fs)
-                for key in ['Mean','RMS','Std','Variance','Min','Max','SMA','Dominant Frequency','Total Power','Loco Power','Freeze Power','Freeze Index','Low Freq Ratio','PSE']:
-                    name=f'{sensor}_{axis}_{key.replace(" ","_")}';row[name]=values[key]
-                    if len(rows)==0:names.append(name)
+                f={key: values[key.replace('_',' ')] for key in axis_names(config)}
+                channel_values[(sensor,axis)]=f
+                row.update({f'{sensor}_{axis}_{key}':value for key,value in f.items()})
+        row.update(window_extra(item['Signals'],fs,config,channel_values))
         rows.append(row)
     report=dict(Recording_ID=rid,Subject_ID=re.match(r'S\d+',rid).group(),Status='ok',Raw_Samples=len(raw),Excluded_Samples=int(excluded.sum()),Excluded_FOG_Samples=int((excluded & (raw.Label.to_numpy()==2)).sum()),Excluded_Non_FOG_Samples=int((excluded & (raw.Label.to_numpy()==1)).sum()),Excluded_Regions=json.dumps(regions,ensure_ascii=False),Selected_Samples=sum(len(d) for _,d in runs),Selected_Runs=len(runs),Windows=len(meta),FOG_Windows=sum(m['Binary_Label']==1 for m in meta),Non_FOG_Windows=sum(m['Binary_Label']==0 for m in meta))
     return pd.DataFrame(rows),names,report

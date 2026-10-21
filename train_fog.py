@@ -22,7 +22,7 @@ every subject. Null denotes undefined metrics. Outer models are evaluation model
 not a deployment model trained on all subjects. FOG iff score > saved threshold.
 The legacy holdout --tune --threshold-tuning path retains its existing extra CV.
 """
-RELEASE_VERSION = 'fog-unified-1.1'
+RELEASE_VERSION = 'fog-unified-1.2-no-dwt'
 import argparse
 import hashlib
 import json
@@ -38,6 +38,8 @@ from sklearn.metrics import (accuracy_score, average_precision_score, balanced_a
                              classification_report, confusion_matrix, f1_score, roc_auc_score)
 from sklearn.model_selection import GridSearchCV, GroupShuffleSplit, StratifiedGroupKFold, LeaveOneGroupOut
 from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from feature_registry import feature_names as schema_feature_names
 from sklearn.preprocessing import StandardScaler
 from sklearn.svm import SVC
 
@@ -122,7 +124,9 @@ def _read_file(path):
         if config is not None and config != external_config:
             raise ValueError('config_json trong NPZ khác config JSON bên cạnh file.')
         config = external_config
-    return _normalize_columns(frame), config
+    frame=_normalize_columns(frame)
+    if path.suffix.lower()=='.npz':frame.attrs['input_feature_names']=names
+    return frame, config
 
 
 def _metadata(frame, path):
@@ -210,6 +214,10 @@ def _pivot_long(frame):
 
 
 def _wide_features(frame):
+    declared=frame.attrs.get('input_feature_names')
+    if declared is not None:
+        if len(declared)!=len(set(declared)) or not set(declared).issubset(frame.columns):raise ValueError('Feature names trùng hoặc thiếu.')
+        return declared
     names = []
     for sensor in SENSORS:
         for axis in AXES:
@@ -218,6 +226,8 @@ def _wide_features(frame):
             if present and len(present) != len(FEATURES):
                 raise ValueError('Bộ feature không đầy đủ cho channel ' + prefix)
             names.extend(present)
+    unknown=[c for c in frame.columns if c not in names and (any(c.startswith(ss+'_'+aa+'_') for ss in SENSORS for aa in AXES) or '_Mag_XCorr' in c or '_LogATER_' in c or '_Corr_' in c)]
+    if unknown:raise ValueError('Feature mới không có schema; cần wide CSV + config JSON hoặc NPZ feature_names: '+', '.join(unknown[:5]))
     if not names:
         raise ValueError('Không có feature window. Chỉ nhận dữ liệu feature, không nhận raw signal.')
     return names
@@ -264,21 +274,30 @@ def load_datasets(paths):
             frame, config = _read_file(path)
             if frame.empty:
                 raise ValueError('Dataset rỗng.')
+            declared=frame.attrs.get('input_feature_names')
+            if config is not None and config.get('feature_version')=='extended-no-dwt-v1':
+                expected=schema_feature_names(config)
+                if declared is not None and declared!=expected:raise ValueError('NPZ feature_names khác schema config.')
+                declared=expected
             frame = _metadata(frame, path)
+            if declared is not None:frame.attrs['input_feature_names']=declared
             if config is not None and 'Config_ID' in frame:
                 if str(frame.Config_ID.iloc[0]) != str(config.get('config_id')):
                     raise ValueError('Config_ID của dữ liệu khác JSON configuration.')
             is_long = 'Sensor' in frame and 'Axis' in frame
             schema = 'long-pivoted' if is_long else 'wide'
             if is_long:
+                if config is not None and config.get('feature_version')=='extended-no-dwt-v1':raise ValueError('Feature mở rộng cần wide CSV/NPZ từ export mới, không dùng long input.')
                 frame, current = _pivot_long(frame)
             else:
                 current = _wide_features(frame)
             if frame.empty:
                 raise ValueError('Dataset rỗng.')
             X = frame[current].apply(pd.to_numeric, errors='raise').to_numpy(float)
-            if not np.isfinite(X).all():
-                raise ValueError('Feature chứa NaN/Inf.')
+            if np.isinf(X).any():raise ValueError('Feature chứa Inf.')
+            base_columns=[f'{ss}_{aa}_{ff}' for ss in SENSORS for aa in AXES for ff in FEATURES if f'{ss}_{aa}_{ff}' in frame]
+            if not np.isfinite(frame[base_columns].to_numpy(float)).all():raise ValueError('Feature gốc chứa NaN/Inf.')
+            if np.isnan(X).any() and (config is None or config.get('feature_version')!='extended-no-dwt-v1'):raise ValueError('NaN chỉ được phép trong schema feature mở rộng.')
             if names is not None and current != names:
                 raise ValueError('Bộ feature/channels khác các input trước; không ghép cấu hình sensor khác nhau.')
             names = current
@@ -376,7 +395,7 @@ def diagnostic_metrics(y_true, y_pred):
     }
 
 
-TRAINER_VERSION = 'fog-unified-1.1-loso-2level-1'
+TRAINER_VERSION = 'fog-unified-1.2-no-dwt-loso-2level-1'
 
 
 def _write_json(path, value):
@@ -531,7 +550,7 @@ def _patient_metrics(y, scores, groups, threshold):
 def predict_with_threshold(bundle, X):
     """Inference on unscaled feature vectors in bundle feature_names order."""
     X = np.asarray(X, dtype=float)
-    if X.ndim != 2 or X.shape[1] != len(bundle['feature_names']) or not np.isfinite(X).all():
+    if X.ndim != 2 or X.shape[1] != len(bundle['feature_names']) or np.isinf(X).any():
         raise ValueError('X inference sai kích thước hoặc chứa NaN/Inf.')
     score = bundle['pipeline'].decision_function(X)
     threshold = float(bundle.get('decision_threshold', 0.))
@@ -619,7 +638,7 @@ def train(paths, output, test_size=.25, seed=42, *, kernel='rbf', C=1., gamma='s
         raise ValueError('Chọn thư mục output mới/rỗng cho validation để tránh trộn kết quả cũ.')
     data, names, config = load_datasets(paths)
     train_idx, test_idx = _split(data, test_size, seed, test_subjects)
-    pipeline = Pipeline([('scaler', StandardScaler()),
+    pipeline = Pipeline([('imputer', SimpleImputer(strategy='median',add_indicator=True,keep_empty_features=True)), ('scaler', StandardScaler()),
                          ('svm', SVC(kernel=kernel, C=C, gamma=gamma, class_weight='balanced',
                                      probability=False, cache_size=cache_size))])
     X_train, y_train = data['X'][train_idx], data['y'][train_idx]
@@ -672,7 +691,7 @@ def train(paths, output, test_size=.25, seed=42, *, kernel='rbf', C=1., gamma='s
     y_test = data['y'][test_idx]
     report = classification_report(y_test, prediction, labels=[0, 1], target_names=['Non-FOG', 'FOG'],
                                    output_dict=True, zero_division=0)
-    metrics = {'model': 'StandardScaler + SVC', 'kernel': kernel,
+    metrics = {'model': 'SimpleImputer + StandardScaler + SVC', 'kernel': kernel,
                'class_weight': 'balanced', 'decision_threshold': float(decision_threshold), 'seed': seed,
                'status': 'completed', 'trainer_version': TRAINER_VERSION,
                'threshold_selection': 'subject-grouped OOF validation' if threshold_tuning else 'fixed',
@@ -960,7 +979,7 @@ def train_loso(paths, output, *, kernel='rbf', C=1., gamma='scale', seed=42,
                 'threshold_grid': {'min': threshold_min, 'max': threshold_max, 'step': threshold_step}}
     _write_json(output / 'run_settings.json', settings)
     _write_json(output / 'run_status.json', {'status': 'running', 'completed_subjects': []})
-    pipeline = Pipeline([('scaler', StandardScaler()),
+    pipeline = Pipeline([('imputer', SimpleImputer(strategy='median',add_indicator=True,keep_empty_features=True)), ('scaler', StandardScaler()),
                          ('svm', SVC(kernel=kernel, C=C, gamma=gamma,
                                      class_weight='balanced', probability=False,
                                      cache_size=cache_size))])
