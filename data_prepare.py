@@ -1,5 +1,5 @@
 """One batch/interactive export route. No GUI imports and no alternate algorithms."""
-RELEASE_VERSION = 'fog-unified-1.2-no-dwt'
+RELEASE_VERSION = 'fog-unified-1.3-features'
 import argparse
 import copy
 import json
@@ -11,7 +11,7 @@ import numpy as np
 import pandas as pd
 from signal_processing import Config,prepare_recording,recording_id,merge_configs,GUI_SENSORS,GUI_AXES
 
-from feature_registry import axis_names, window_names, feature_names
+from feature_registry import feature_names, axis_names, window_names
 
 FEATURES=['Mean','RMS','Std','Variance','Min','Max','SMA','Dominant_Frequency','Total_Power','Loco_Power','Freeze_Power','Freeze_Index','Low_Freq_Ratio','PSE']
 
@@ -57,18 +57,11 @@ def export_dataset(table,names,config,destination,format='both',report=None):
     root.parent.mkdir(parents=True,exist_ok=True)
     required=['Subject_ID','Recording_ID','Segment_ID','Window_ID','Start_Time','End_Time','Label','FOG_Ratio','Config_ID']
     if not set(required+names).issubset(table.columns):raise ValueError('Thiếu feature hoặc metadata.')
-    arr=table[names].to_numpy(float)
-    if np.isinf(arr).any():raise ValueError('Feature chứa Inf.')
-    base_cols=[f'{ss}_{aa}_{ff}' for ss in config['sensors'] for aa in config['axes'] for ff in FEATURES]
-    if not np.isfinite(table[base_cols].to_numpy(float)).all():raise ValueError('Feature gốc chứa NaN/Inf; không impute lỗi xử lý cũ.')
-    if np.isnan(arr).any() and 'undefined_feature_policy' not in config:raise ValueError('Feature chứa NaN ngoài schema mở rộng.')
-    if names != feature_names(config):raise ValueError('Feature names không khớp schema.')
+    values=table[names].to_numpy(float)
+    if np.isinf(values).any(): raise ValueError('Feature chứa Inf.')
+    if np.nanmax(np.abs(values),initial=0)>np.finfo(np.float32).max: raise ValueError('Feature vượt giới hạn float32.')
     if not table.Label.isin([0,1]).all():raise ValueError('ML label phải là 0/1.')
     if not (table.Config_ID==config['config_id']).all():raise ValueError('Config_ID của bảng không khớp cấu hình xuất.')
-    if report is not None:
-        report=report.copy()
-        report['Feature_Count']=len(names)
-        report['Undefined_Feature_Values']=report.Recording_ID.map(table.assign(_missing=np.isnan(arr).sum(axis=1)).groupby('Recording_ID')._missing.sum()).fillna(0).astype(int)
     payload=dict(X=table[names].to_numpy(np.float32),y=table.Label.to_numpy(np.int8),feature_names=np.asarray(names,dtype=str),subject_id=table.Subject_ID.to_numpy(str),recording_id=table.Recording_ID.to_numpy(str),segment_id=table.Segment_ID.to_numpy(np.int32),window_id=table.Window_ID.to_numpy(np.int32),window_start=table.Start_Time.to_numpy(float),window_end=table.End_Time.to_numpy(float),fog_ratio=table.FOG_Ratio.to_numpy(np.float32),config_id=table.Config_ID.to_numpy(str),config_json=np.asarray(json.dumps(configuration,ensure_ascii=False)))
     staged=[]
     with tempfile.TemporaryDirectory(dir=root.parent) as temp:
@@ -101,8 +94,10 @@ def wide_from_gui(table,config):
                 if len(channel)!=1:raise ValueError('Thiếu kênh trong window.')
                 row.update({f'{sensor}_{axis}_{f}':float(channel.iloc[0][f]) for f in axis_names(config)})
         for key in window_names(config):
-            if key not in part or not np.allclose(part[key].to_numpy(float),float(part.iloc[0][key]),equal_nan=True):raise ValueError('Feature liên kênh không nhất quán: '+key)
-            row[key]=float(part.iloc[0][key])
+            if key not in part: raise ValueError('Thiếu đặc trưng cửa sổ: '+key)
+            v=part[key].to_numpy(float)
+            if not np.all(np.isclose(v,v[0],equal_nan=True)): raise ValueError('Đặc trưng dùng chung giữa các trục không khớp: '+key)
+            row[key]=float(v[0])
         rows.append(row)
     return pd.DataFrame(rows),names
 

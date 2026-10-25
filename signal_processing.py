@@ -1,5 +1,5 @@
 """Single numerical pipeline shared by GUI, batch and CLI. Original formulas preserved."""
-RELEASE_VERSION = 'fog-unified-1.2-no-dwt'
+RELEASE_VERSION = 'fog-unified-1.3-features'
 import copy
 import hashlib
 import json
@@ -9,7 +9,7 @@ from fractions import Fraction
 import numpy as np
 import pandas as pd
 from scipy import signal
-from feature_registry import BASE, GROUPS, options, axis_names, window_names, feature_names, axis_extra, window_extra
+from feature_registry import BASE, GROUPS, options, axis_names, window_names, feature_names, axis_extra, window_extra, temporal_extra, wavelet_module
 PIPELINE_VERSION = 'original14-unified-v1'
 GUI_SENSORS = ('Ankle','Thigh','Trunk')
 GUI_AXES = ('Forward','Vertical','Lateral')
@@ -338,23 +338,14 @@ class ProcessingEngine:
         return result
     def _all_feature_rows(self):
         if not self.windowing_applied or not self.window_metadata or not self.window_signal_data:
-            raise ValueError("Hãy APPLY WINDOWING trước khi Publish.")
-        config=self.feature_config;fs=float(self.windowing_sampling_rate);rows=[]
-        for item,meta in zip(self.window_signal_data,self.window_metadata):
-            values={}
-            for sensor in config['sensors']:
-                for axis in config['axes']:
-                    col=f'{sensor}_{axis}_mg'
-                    if col not in item['Signals']: raise ValueError('Thiếu tín hiệu: '+col)
-                    f=self._compute_features(item['Signals'][col],fs)
-                    values[(sensor,axis)]={k: f[k.replace('_',' ')] for k in axis_names(config)}
-            shared=window_extra(item['Signals'],fs,config,values)
+            raise ValueError('Hãy APPLY WINDOWING trước khi Publish.')
+        rows=[];config=self.feature_config
+        for meta,values,shared in window_feature_records(self.window_signal_data,self.window_metadata,float(self.windowing_sampling_rate),config):
             for (sensor,axis),f in values.items():
-                row=dict(Window_ID=int(meta['Window_ID']),Segment_ID=int(meta['Segment_ID']),
-                         Sensor=sensor,Axis=dict(zip(GUI_AXES,['X','Y','Z']))[axis],
-                         Start_Time=float(meta['Start_Time']),End_Time=float(meta['End_Time']),
-                         Binary_Label=int(meta['Binary_Label']),FOG_Ratio=float(meta['FOG_Ratio']))
-                row.update(f);row.update(shared);rows.append(row)
+                row=dict(Window_ID=int(meta['Window_ID']),Segment_ID=int(meta['Segment_ID']),Sensor=sensor,
+                         Axis=dict(zip(GUI_AXES,['X','Y','Z']))[axis],Start_Time=float(meta['Start_Time']),
+                         End_Time=float(meta['End_Time']),Binary_Label=int(meta['Binary_Label']),FOG_Ratio=float(meta['FOG_Ratio']))
+                row.update({key:f[key] for key in axis_names(config)});row.update(shared);rows.append(row)
         return pd.DataFrame(rows)
 
 def gui_read_raw(path):
@@ -511,14 +502,20 @@ def _canonicalize_dict(config):
     result['schema']='fog-unified-v1'
     result['feature_version'] = 'original14-welch64-bandfix-v2'
     fo=options(result)
-    if any(fo[k] for k in GROUPS):
+    if any(fo[k] for k in GROUPS) or fo['base_features']!=BASE:
         result['feature_options']=fo
-        result['feature_version']='extended-no-dwt-v1'
+        result['feature_version']='selected-extended-v2'
         result['feature_names']=feature_names(result)
         result['undefined_feature_policy']='nan; train-fold median imputation with indicators; empty features -> 0'
     else:
         for key in ['feature_options','feature_names','undefined_feature_policy']: result.pop(key,None)
 
+    if not feature_names(result): raise ValueError('Cần chọn ít nhất một đặc trưng.')
+    if fo['wavelet']:
+        pywt=wavelet_module();wavelet=pywt.Wavelet(fo['wavelet_name']);n=int(round(c['window_length_spinbox']*fs))
+        maximum=pywt.dwt_max_level(n,wavelet.dec_len)
+        if fo['wavelet_level']>maximum: raise ValueError(f'{n} mẫu: {wavelet.name} chỉ hỗ trợ mức hữu ích <= {maximum}. Giảm DWT level hoặc tăng window.')
+    if fo['harmonic'] and fo['harmonic_f0_hz']*fo['harmonic_count']>=fs/2: raise ValueError('Harmonic cao nhất phải nhỏ hơn Nyquist.')
     result['spectral_settings'] = {
         'method': 'welch',
         'window': 'hann',
@@ -597,18 +594,12 @@ def prepare_recording(path,config):
         else:
             if channel_meta!=meta:raise ValueError('Cửa sổ giữa các vị trí không đồng bộ.')
             for item,new in zip(items,channel_items):item['Signals'].update(new['Signals'])
-    engine=ProcessingEngine(local);rows=[];names=feature_names(config)
-    for item,m in zip(items,meta):
+    rows=[];names=feature_names(config)
+    for m,channel_values,shared in window_feature_records(items,meta,fs,local):
         row=dict(Subject_ID=re.match(r'S\d+',rid).group(),Recording_ID=rid,Segment_ID=m['Segment_ID'],Window_ID=m['Window_ID'],Start_Time=m['Start_Time'],End_Time=m['End_Time'],Label=m['Binary_Label'],FOG_Ratio=m['FOG_Ratio'],Config_ID=config['config_id'])
-        channel_values={}
-        for sensor in config['sensors']:
-            for axis in config['axes']:
-                values=engine._compute_features(item['Signals'][f'{sensor}_{axis}_mg'],fs)
-                f={key: values[key.replace('_',' ')] for key in axis_names(config)}
-                channel_values[(sensor,axis)]=f
-                row.update({f'{sensor}_{axis}_{key}':value for key,value in f.items()})
-        row.update(window_extra(item['Signals'],fs,config,channel_values))
-        rows.append(row)
+        for (sensor,axis),values in channel_values.items():
+            row.update({f'{sensor}_{axis}_{key}':values[key] for key in axis_names(config)})
+        row.update(shared);rows.append(row)
     report=dict(Recording_ID=rid,Subject_ID=re.match(r'S\d+',rid).group(),Status='ok',Raw_Samples=len(raw),Excluded_Samples=int(excluded.sum()),Excluded_FOG_Samples=int((excluded & (raw.Label.to_numpy()==2)).sum()),Excluded_Non_FOG_Samples=int((excluded & (raw.Label.to_numpy()==1)).sum()),Excluded_Regions=json.dumps(regions,ensure_ascii=False),Selected_Samples=sum(len(d) for _,d in runs),Selected_Runs=len(runs),Windows=len(meta),FOG_Windows=sum(m['Binary_Label']==1 for m in meta),Non_FOG_Windows=sum(m['Binary_Label']==0 for m in meta))
     return pd.DataFrame(rows),names,report
 
@@ -632,3 +623,21 @@ def canonical_config(value):return Config.from_dict(value)
 def compute_features(x,fs):
     # Feature extraction needs no GUI state.
     return ProcessingEngine.__new__(ProcessingEngine)._compute_features(x,fs)
+
+
+def window_feature_records(items,metadata,fs,config):
+    if len(items)!=len(metadata): raise ValueError('Window signals và metadata không khớp.')
+    engine=ProcessingEngine(config);o=options(config);history=[];previous_segment=None;previous_start=None
+    controls=config['controls'];step=max(1,int(round(round(controls['window_length_spinbox']*fs)*(1-controls['window_overlap_spinbox']/100))))/fs
+    for item,meta in zip(items,metadata):
+        start=float(meta['Start_Time']);segment=meta['Segment_ID'];values={}
+        if segment!=previous_segment or previous_start is None or not 0<start-previous_start<=step+1.5/fs: history=[]
+        for sensor in config['sensors']:
+            for axis in config['axes']:
+                f=engine._compute_features(item['Signals'][f'{sensor}_{axis}_mg'],fs)
+                values[(sensor,axis)]={key.replace(' ','_'):value for key,value in f.items() if not key.startswith(('FFT_','PSD_'))}
+        shared=window_extra(item['Signals'],fs,config,values)
+        shared.update(temporal_extra(history,values,start,config,fs))
+        yield meta,values,shared
+        history.append((start,values));history=history[-o['temporal_history']:]
+        previous_segment=segment;previous_start=start

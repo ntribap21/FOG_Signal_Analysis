@@ -1,7 +1,7 @@
 """FOG GUI: one processing pipeline; detect mixed modules before creating the GUI."""
 from pathlib import Path as _ReleasePath
 import importlib as _ReleaseImport
-RELEASE_VERSION = 'fog-unified-1.2-no-dwt'
+RELEASE_VERSION = 'fog-unified-1.3-features'
 
 def _load_matching_module(name):
     try:
@@ -14,6 +14,7 @@ def _load_matching_module(name):
 
 _processing_module = _load_matching_module('signal_processing')
 _preparation_module = _load_matching_module('data_prepare')
+_registry_module = _load_matching_module('feature_registry')
 
 import sys
 import os
@@ -390,9 +391,9 @@ class SignalViewer(QWidget):
         self.regionSelected.emit(float(a), float(b))
 from PySide6.QtWidgets import QTabWidget, QScrollArea, QLineEdit
 import copy
-from signal_processing import Config, ProcessingEngine, gui_read_raw, gui_labels, gui_split, gui_select, gui_process, gui_windows, gui_feature_rows, canonical_config, normalize_exclusions, merge_configs, recording_id
+from signal_processing import Config, ProcessingEngine, gui_read_raw, gui_labels, gui_split, gui_select, gui_process, gui_windows, gui_feature_rows, canonical_config, normalize_exclusions, merge_configs, recording_id, window_feature_records
 from data_prepare import prepare_files, export_dataset, gui_export
-from feature_registry import GROUPS, DEFAULTS, options as feature_options, feature_names, axis_names, window_names
+from feature_registry import BASE, GROUPS, DEFAULTS, options as feature_options, feature_names, axis_names, window_names
 
 class FOGSignalAnalyzer(QMainWindow):
     """Single GUI class; shared signal_processing owns the numerical pipeline."""
@@ -467,7 +468,7 @@ class FOGSignalAnalyzer(QMainWindow):
         self.setMinimumSize(1200, 680)
         self._copy_analysis_to_batch()
         self.restore_saved_config()
-        self.setWindowTitle('FOG Signal Analyzer — Unified Pipeline v1')
+        self.setWindowTitle('FOG Signal Analyzer — v1.3 Feature Selection')
 
 
     def restore_saved_config(self):
@@ -561,13 +562,14 @@ class FOGSignalAnalyzer(QMainWindow):
         self.data_selection_page = self._create_selection_page()
         self.selected_time_page = self._create_selected_page()
         self.preprocessing_page = self._create_processing_page()
+        self.feature_selection_page = self._create_feature_selection_page()
         self.windowing_page = self._create_window_page()
         self.time_analysis_page = self.create_time_analysis_page()
         self.frequency_analysis_page = self.create_frequency_analysis_page()
         self.publish_page = self._create_export_page()
         self.analysis_page = self.time_analysis_page
-        self._page_list = [self.batch_page, self.dataset_page, self.time_domain_page, self.data_selection_page, self.selected_time_page, self.preprocessing_page, self.windowing_page, self.time_analysis_page, self.frequency_analysis_page, self.publish_page]
-        self.navigation.addItems(['Batch Preparation', '1. Dataset', '2. Raw Time Domain', '3. Data Selection', '4. Selected Time Domain', '5. Preprocessing', '6. Windowing', '7. Time Analysis', '8. Frequency Analysis', '9. Export'])
+        self._page_list = [self.batch_page, self.dataset_page, self.time_domain_page, self.data_selection_page, self.selected_time_page, self.preprocessing_page, self.feature_selection_page, self.windowing_page, self.time_analysis_page, self.frequency_analysis_page, self.publish_page]
+        self.navigation.addItems(['Batch Preparation', '1. Dataset', '2. Raw Time Domain', '3. Data Selection', '4. Selected Time Domain', '5. Preprocessing', '6. Feature Selection', '7. Windowing', '8. Time Analysis', '9. Frequency Analysis', '10. Export'])
         for page in self._page_list:
             self.pages.addWidget(page)
         self.navigation.currentRowChanged.connect(self._navigate)
@@ -1346,15 +1348,18 @@ class FOGSignalAnalyzer(QMainWindow):
         self.windowing_status_message.setText('Configure Window Length / Overlap, then press APPLY WINDOWING.')
 
     def apply_windowing(self):
-        runs, fs = self._window_input()
-        if not runs:
-            self._error('Hãy APPLY DATA SELECTION trước.')
-            return
-        config = self.capture_config()
-        if self.applied_config:
-            for name in self.CONTROL_NAMES[:9]:
-                config['controls'][name] = self.applied_config['controls'][name]
-        self._start_job(lambda progress: gui_windows(runs, config, fs), lambda result: self._install_windows(result, config, fs))
+        try:
+            runs, fs = self._window_input()
+            if not runs:
+                self._error('Hãy APPLY DATA SELECTION trước.')
+                return
+            config = self.capture_config()
+            if self.applied_config:
+                for name in self.CONTROL_NAMES[:9]:
+                    config['controls'][name] = self.applied_config['controls'][name]
+            self._start_job(lambda progress: gui_windows(runs, config, fs), lambda result: self._install_windows(result, config, fs))
+        except Exception as exc:
+            self._error(exc)
 
     def show_window_preview(self):
         """Hiển thị metadata của tất cả window đã tạo."""
@@ -1551,7 +1556,7 @@ class FOGSignalAnalyzer(QMainWindow):
             self.analysis_psd_power = proc_feat['PSD_Power']
             for plot, data, title in [(self.analysis_raw_time_plot, raw, f'Raw | Window {wid} | {sensor} {axis}'), (self.analysis_time_plot, processed, f'After Preprocessing | Window {wid} | {sensor} {axis}')]:
                 plot.clear()
-                plot.plot(t, data, pen=pg.mkPen(width=1.25), antialias=True)
+                plot.plot(t, data, pen=pg.mkPen(color='#2563eb' if plot is self.analysis_time_plot else '#64748b',width=1.5), antialias=True)
                 self._reset_plot_x(plot, t)
                 finite = data[np.isfinite(data)]
                 if len(finite):
@@ -1561,9 +1566,10 @@ class FOGSignalAnalyzer(QMainWindow):
                     plot.setYRange(lo - pad, hi + pad, padding=0)
                 plot.setTitle(title)
             for name in ['Mean', 'RMS', 'Std', 'Variance', 'Min', 'Max', 'SMA']:
-                self.time_feature_labels[name].setText(f'{name}: {proc_feat[name]:.6f} g' if name not in ['Variance'] else f'{name}: {proc_feat[name]:.6f} g²')
+                selected=name.replace(' ','_') in axis_names(self.window_config or self.capture_config())
+                self.time_feature_labels[name].setText((f'{name}: {proc_feat[name]:.6f} '+('g²' if name=='Variance' else 'g')) if selected else f'{name}: — (not selected)')
             self.analysis_status.setText(f"Window {wid} | {('FOG' if int(meta['Binary_Label']) else 'Non-FOG')} | {sensor} {axis} | Fs={fs:g} Hz | Raw + Preprocessed ready")
-            self._show_extra_features(proc_feat)
+            self._show_selected_window_features(wid,meta,sensor,axis,proc_feat)
             self._plot_frequency_from_features(proc_feat, wid, meta, sensor, axis)
             self.update_publish_preview()
         except Exception as error:
@@ -1952,13 +1958,16 @@ class FOGSignalAnalyzer(QMainWindow):
             lab = QLabel(f'{name}: -')
             self.time_feature_labels[name] = lab
             fl.addWidget(lab, i // 4, i % 4)
-        main.addWidget(feature_group)
+        features_row=QHBoxLayout()
+        features_row.addWidget(feature_group,1)
         self.extra_feature_table=QTableWidget(0,3)
         self.extra_feature_table.setHorizontalHeaderLabels(['Additional feature','Value','Unit'])
-        self.extra_feature_table.setMaximumHeight(150)
+        self.extra_feature_table.setMinimumHeight(170)
+        self.extra_feature_table.setMaximumHeight(210)
         self.extra_feature_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self.extra_feature_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        main.addWidget(self.extra_feature_table)
+        features_row.addWidget(self.extra_feature_table,2)
+        main.addLayout(features_row)
         self.analysis_time_stats = QLabel('Select a window and press ANALYZE WINDOW.')
         self.analysis_time_stats.setStyleSheet('padding:2px;color:#555;')
         main.addWidget(self.analysis_time_stats)
@@ -2085,6 +2094,7 @@ class FOGSignalAnalyzer(QMainWindow):
         self._clear_analysis_plots_only()
 
     def _clear_analysis_plots_only(self):
+        self._reset_analysis_feature_labels()
         for name in ['analysis_raw_time_plot', 'analysis_time_plot', 'analysis_fft_plot', 'analysis_psd_plot']:
             w = getattr(self, name, None)
             if w is not None:
@@ -2092,6 +2102,7 @@ class FOGSignalAnalyzer(QMainWindow):
                 w.enableAutoRange(x=False, y=False)
 
     def _reset_analysis_feature_labels(self):
+        if hasattr(self,'extra_feature_table'):self.extra_feature_table.setRowCount(0)
         for d in [getattr(self, 'time_feature_labels', {}), getattr(self, 'frequency_feature_labels', {})]:
             for k, w in d.items():
                 w.setText(f'{k}: -')
@@ -2158,8 +2169,10 @@ class FOGSignalAnalyzer(QMainWindow):
         self.analysis_fft_plot.setTitle(f'FFT Spectrum | Window {wid}')
         self.analysis_psd_plot.setTitle(f'PSD (Welch) | Window {wid}')
         vals = [('Dominant Frequency', feat['Dominant Frequency']), ('Total Power', feat['Total Power']), ('Loco Power', feat['Loco Power']), ('Freeze Power', feat['Freeze Power']), ('Freeze Index', feat['Freeze Index']), ('Low Freq Ratio', feat['Low Freq Ratio']), ('PSE', feat['PSE'])]
+        selected=axis_names(self.window_config or self.capture_config())
         for name, v in vals:
-            self.frequency_feature_labels[name].setText(f'{name}: {v:.6f}' if name != 'Dominant Frequency' else f'{name}: {v:.3f} Hz')
+            text=(f'{name}: {v:.6f}' if name != 'Dominant Frequency' else f'{name}: {v:.3f} Hz')
+            self.frequency_feature_labels[name].setText(text if name.replace(' ','_') in selected else f'{name}: — (not selected)')
         self.analysis_frequency_stats.setText(f"Window {wid} | {sensor} {axis} | Dominant={feat['Dominant Frequency']:.3f} Hz | Total Power={feat['Total Power']:.6g} | FI={feat['Freeze Index']:.6f} | PSE={feat['PSE']:.4f}")
 
     def analyze_frequency_selected_window(self):
@@ -2248,6 +2261,9 @@ class FOGSignalAnalyzer(QMainWindow):
         for group in self.findChildren(QGroupBox):
             grid = group.layout()
             if isinstance(grid, QGridLayout):
+                if grid.objectName()=='feature_base_grid':
+                    for column in range(4):grid.setColumnStretch(column,1)
+                    continue
                 grid.setHorizontalSpacing(10)
                 grid.setVerticalSpacing(8)
                 grid.setColumnMinimumWidth(0, 100)
@@ -2264,7 +2280,7 @@ class FOGSignalAnalyzer(QMainWindow):
         self.navigation.blockSignals(False)
 
     def _navigate(self, index):
-        actions = [self.show_batch, self.show_dataset_page, self.show_time_domain, self.show_data_selection, self.show_selected_time, self.show_preprocessing, self.show_windowing, self.show_analysis, self.show_frequency_analysis, self.show_publish_page]
+        actions = [self.show_batch, self.show_dataset_page, self.show_time_domain, self.show_data_selection, self.show_selected_time, self.show_preprocessing, self.show_feature_selection, self.show_windowing, self.show_analysis, self.show_frequency_analysis, self.show_publish_page]
         if 0 <= index < len(actions):
             actions[index]()
 
@@ -2317,7 +2333,7 @@ class FOGSignalAnalyzer(QMainWindow):
         layout.addLayout(row)
         layout.addWidget(self._note('Resample → Filter → Detrend trên từng đoạn. Bộ lọc dùng đúng hàm gốc: filtfilt; đoạn ngắn dùng lfilter như bản gốc.'))
         actions = QHBoxLayout()
-        for text, slot in [('RESET', self.reset_preprocessing), ('APPLY PREPROCESSING', self.apply_preprocessing), ('VIEW PROCESSED', self.view_processed_time_domain), ('NEXT → WINDOWING', self.show_windowing)]:
+        for text, slot in [('RESET', self.reset_preprocessing), ('APPLY PREPROCESSING', self.apply_preprocessing), ('VIEW PROCESSED', self.view_processed_time_domain), ('NEXT → FEATURES', self.show_feature_selection)]:
             actions.addWidget(self._button(text, slot))
         layout.addLayout(actions)
         self.processing_message = self._note('Chưa xử lý.')
@@ -2346,61 +2362,148 @@ class FOGSignalAnalyzer(QMainWindow):
         layout.addWidget(self.window_table, 1)
         return page
 
+    def _create_feature_selection_page(self):
+        page,layout=self._heading_page('FEATURE SELECTION')
+        scroll=QScrollArea();scroll.setWidgetResizable(True);scroll.setWidget(self._feature_panel('analysis'))
+        layout.addWidget(scroll,1)
+        self.feature_summary=self._note('Chọn đặc trưng trước khi APPLY WINDOWING.')
+        layout.addWidget(self.feature_summary)
+        row=QHBoxLayout()
+        row.addWidget(self._button('BACK TO PREPROCESSING',self.show_preprocessing))
+        row.addWidget(self._button('COPY FEATURES TO BATCH',self._copy_features_to_batch))
+        row.addWidget(self._button('NEXT → WINDOWING',self.show_windowing))
+        layout.addLayout(row)
+        return page
+
+    def show_feature_selection(self):
+        self._go(self.feature_selection_page)
+        self._update_feature_summary()
+
+    def _update_feature_summary(self):
+        if not hasattr(self,'feature_summary'): return
+        try:
+            c=self.capture_config()
+            self.feature_summary.setText(f"{len(feature_names(c))} features/window · {', '.join(c['sensors'])} · {', '.join(c['axes'])}")
+        except Exception as exc:
+            self.feature_summary.setText(str(exc))
+
+    def _copy_features_to_batch(self):
+        self._restore_feature_options('batch',{'feature_options':self._get_feature_options('analysis')})
+        self._batch_changed()
+
     def _feature_panel(self, scope):
-        box=QGroupBox('ADDITIONAL FEATURES (optional)');layout=QGridLayout(box)
-        checks={};params={}
+        box=QGroupBox('FEATURES');layout=QVBoxLayout(box)
+        base=QGroupBox('BASIC FEATURES — choose individually');grid=QGridLayout(base);grid.setObjectName('feature_base_grid');basechecks={}
+        for i,name in enumerate(BASE):
+            w=QCheckBox(name.replace('_',' '));w.setChecked(True);basechecks[name]=w;grid.addWidget(w,i//4,i%4)
+            w.toggled.connect(lambda _=False,sc=scope:self._features_changed(sc))
+        buttons=QHBoxLayout()
+        for label,value in [('ALL BASIC',True),('NO BASIC',False)]:
+            b=QPushButton(label);b.clicked.connect(lambda _=False,sc=scope,v=value:self._set_feature_checks(sc,'base',v));buttons.addWidget(b)
+        grid.addLayout(buttons,(len(BASE)+3)//4,0,1,4);layout.addWidget(base)
+        extras=QGroupBox('ADDITIONAL FEATURE GROUPS');g=QGridLayout(extras);checks={}
         for i,(key,label) in enumerate(GROUPS.items()):
-            w=QCheckBox(label);checks[key]=w;layout.addWidget(w,i//2,i%2)
+            w=QCheckBox(label);checks[key]=w;g.addWidget(w,i//2,i%2)
             if scope=='analysis' and key in ('crosscorr','ater'):
-                w.setEnabled(False);w.setToolTip('Multi-position features: use Batch Configuration with all three axes.')
-            w.toggled.connect(lambda _=False, sc=scope: self._features_changed(sc))
-        offset=(len(GROUPS)+1)//2
+                w.setEnabled(False);w.setToolTip('Use Batch with all three axes and the required sensors.')
+            w.toggled.connect(lambda _=False,sc=scope:self._features_changed(sc))
+        layout.addWidget(extras)
+        params={};settings=QGroupBox('FEATURE PARAMETERS');g=QGridLayout(settings)
+        choices={'wavelet_name':['db4','db8'],'wavelet_mode':['symmetric','periodization'],'magnitude_mode':['dynamic','input']}
+        labels={'wavelet_name':'DWT wavelet','wavelet_level':'DWT level','wavelet_mode':'DWT extension',
+                'magnitude_mode':'Magnitude mode',
+                'harmonic_f0_hz':'Harmonic fundamental (Hz)',
+                'harmonic_count':'Number of harmonics','temporal_history':'Trend history (windows)'}
         for i,(key,default) in enumerate(DEFAULTS.items()):
-            if key=='entropy_m':
-                w=QSpinBox();w.setRange(1,3)
+            if key in choices:
+                w=QComboBox();w.addItems(choices[key]);w.setCurrentText(default)
+                w.currentTextChanged.connect(lambda _=None,sc=scope:self._features_changed(sc))
+            elif type(default) is int:
+                w=QSpinBox();w.setRange(1 if key in ('entropy_m','wavelet_level') else 2,3 if key=='entropy_m' else 5 if key=='wavelet_level' else 20);w.setValue(default)
+                w.valueChanged.connect(lambda _=None,sc=scope:self._features_changed(sc))
             else:
                 w=QDoubleSpinBox();w.setDecimals(10 if key=='ater_epsilon_g2' else 3)
                 w.setRange(1e-10 if key=='ater_epsilon_g2' else .001,1. if key in ('entropy_r_ratio','crosscorr_max_s') else 10.)
-            w.setValue(default);params[key]=w
-            layout.addWidget(QLabel(key),offset+i,0);layout.addWidget(w,offset+i,1)
-            w.valueChanged.connect(lambda _=None,sc=scope:self._features_changed(sc))
-        setattr(self,scope+'_feature_checks',checks);setattr(self,scope+'_feature_params',params)
-        layout.addWidget(self._note('126 original features remain. Undefined extra statistics are NaN and imputed inside each training fold. Cross-correlation / ATER require Batch.'),offset+len(DEFAULTS),0,1,2)
+                w.setValue(default);w.valueChanged.connect(lambda _=None,sc=scope:self._features_changed(sc))
+            params[key]=w;g.addWidget(QLabel(labels.get(key,key)),i//2,(i%2)*2);g.addWidget(w,i//2,(i%2)*2+1)
+        layout.addWidget(settings)
+        layout.addWidget(self._note('DWT bands depend on Fs. At 64 Hz: D3 ≈ 4–8 Hz, D4 ≈ 2–4 Hz. D3/D4 is not the 3–8 / 0.5–3 Hz Freeze Index. Harmonic ratio uses the configured fixed fundamental. Temporal features use past windows only and reset at segment boundaries. Undefined values remain NaN for train-fold imputation.'))
+        setattr(self,scope+'_base_checks',basechecks);setattr(self,scope+'_feature_checks',checks);setattr(self,scope+'_feature_params',params)
         return box
 
+    def _set_feature_checks(self,scope,kind,value):
+        controls=getattr(self,scope+'_base_checks',{}) if kind=='base' else getattr(self,scope+'_feature_checks',{})
+        for w in controls.values():
+            if w.isEnabled(): w.blockSignals(True);w.setChecked(value);w.blockSignals(False)
+        self._features_changed(scope)
+
     def _get_feature_options(self, scope):
-        checks=getattr(self,scope+'_feature_checks',{})
-        params=getattr(self,scope+'_feature_params',{})
-        return {**{k:w.isChecked() for k,w in checks.items()},**{k:w.value() for k,w in params.items()}}
+        checks=getattr(self,scope+'_feature_checks',{});params=getattr(self,scope+'_feature_params',{})
+        base=getattr(self,scope+'_base_checks',{})
+        return {**{k:w.isChecked() for k,w in checks.items()},
+                **{k:w.currentText() if isinstance(w,QComboBox) else w.value() for k,w in params.items()},
+                'base_features':[k for k,w in base.items() if w.isChecked()] if base else list(BASE)}
 
     def _restore_feature_options(self,scope,config):
-        v=feature_options(config)
+        values=feature_options(config)
+        for k,w in getattr(self,scope+'_base_checks',{}).items():
+            w.blockSignals(True);w.setChecked(k in values['base_features']);w.blockSignals(False)
         for k,w in getattr(self,scope+'_feature_checks',{}).items():
-            w.blockSignals(True);w.setChecked(v[k] if w.isEnabled() else False);w.blockSignals(False)
+            w.blockSignals(True);w.setChecked(values[k] if w.isEnabled() else False);w.blockSignals(False)
         for k,w in getattr(self,scope+'_feature_params',{}).items():
-            w.blockSignals(True);w.setValue(v[k]);w.blockSignals(False)
+            w.blockSignals(True)
+            if isinstance(w,QComboBox):w.setCurrentText(values[k])
+            else:w.setValue(values[k])
+            w.blockSignals(False)
 
     def _features_changed(self,scope):
+        if getattr(self,'_building',False): return
         if scope=='batch':
             if hasattr(self,'batch_summary'):self._batch_changed()
             return
-        if hasattr(self,'windowing_applied'):
+        if hasattr(self,'window_model') and hasattr(self,'export_model'):
+            self._invalidate_windows()
+        elif hasattr(self,'windowing_applied'):
             self.windowing_applied=False;self.window_config=None
+        self.statusBar().showMessage('Feature settings changed — APPLY WINDOWING again.')
         if hasattr(self,'publish_info'):self.publish_info.setText('Feature settings changed: APPLY WINDOWING again, then preview/export.')
         if hasattr(self,'extra_feature_table'):self.extra_feature_table.setRowCount(0)
+        self._reset_analysis_feature_labels()
+        self._update_feature_summary()
+
+    def _show_selected_window_features(self,wid,meta,sensor,axis,values):
+        config=self.window_config or self.capture_config();axis_name=dict(X='Forward',Y='Vertical',Z='Lateral')[axis]
+        display={k.replace('_',' '):values[k.replace('_',' ')] for k in axis_names(config) if k not in BASE}
+        idx=next(i for i,m in enumerate(self.window_metadata) if int(m['Window_ID'])==int(wid))
+        history=feature_options(config)['temporal_history'];start=max(0,idx-history+1)
+        records=list(window_feature_records(self.window_signal_data[start:idx+1],self.window_metadata[start:idx+1],float(self.windowing_sampling_rate),config))
+        shared=records[-1][2]
+        for key,value in shared.items():
+            if key.startswith(sensor+'_Magnitude_') or key.startswith(f'{sensor}_{axis_name}_') or '_Corr_' in key:
+                display[key]=value
+        self._show_extra_features(display)
+        self.analysis_time_stats.setText(f'{len(axis_names(config))} selected axis features · {len(display)} additional/context values')
 
     def _show_extra_features(self,values):
         if not hasattr(self,'extra_feature_table'):return
-        keys=[k for k in values if k not in GUI_FEATURES and not k.startswith(('FFT_','PSD_'))]
-        self.extra_feature_table.setRowCount(len(keys))
-        for row,key in enumerate(keys):
-            value=values[key];unit='g/s' if key=='Jerk RMS' else 's' if key=='Autocorr Lag s' else 'dimensionless'
-            for col,text in enumerate([key, f'{value:.6g}' if np.isfinite(value) else 'undefined (train-fold imputation)',unit]):
+        self.extra_feature_table.setRowCount(len(values))
+        for row,(key,value) in enumerate(values.items()):
+            normalized=key.replace(' ','_')
+            if normalized.endswith('Lag_s'):unit='s'
+            elif 'Relative_Energy' in normalized or 'Ratio' in normalized or 'Freeze_Index' in normalized or 'Entropy' in normalized or 'Skewness' in normalized or 'Kurtosis' in normalized or 'Corr' in normalized or 'Flatness' in normalized or 'Crest' in normalized:unit='—'
+            elif normalized.endswith('Lag_s'):unit='s'
+            elif 'Jerk' in normalized or 'Trend_g_s' in normalized:unit='g/s'
+            elif 'Centroid' in normalized or 'Spread' in normalized:unit='Hz'
+            elif 'Energy' in normalized:unit='g²'
+            elif normalized.startswith('Wavelet_') and normalized.endswith('_Std'):unit='g'
+            elif 'Magnitude' in normalized or 'Delta_RMS' in normalized:unit='g'
+            else:unit='—'
+            for col,text in enumerate([key,f'{value:.6g}' if np.isfinite(value) else 'N/A',unit]):
                 self.extra_feature_table.setItem(row,col,QTableWidgetItem(text))
 
     def _create_export_page(self):
         page, layout = self._heading_page('EXPORT FEATURES')
-        layout.addWidget(self._feature_panel('analysis'))
+        layout.addWidget(self._button('FEATURE SELECTION', self.show_feature_selection))
         row = QHBoxLayout()
         self.export_format = QComboBox()
         self.export_format.addItems(['CSV + NPZ', 'NPZ', 'CSV'])
