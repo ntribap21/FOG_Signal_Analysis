@@ -8,6 +8,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import sklearn
+import argparse
 from sklearn.base import clone
 from sklearn.metrics import accuracy_score, average_precision_score, balanced_accuracy_score, classification_report, confusion_matrix, f1_score, roc_auc_score
 from sklearn.model_selection import GridSearchCV, GroupShuffleSplit, StratifiedGroupKFold, LeaveOneGroupOut
@@ -15,7 +16,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.svm import SVC
-import argparsefrom scipy.signal import medfilt
+from scipy.signal import medfilt
 FEATURES = ['Mean', 'RMS', 'Std', 'Variance', 'Min', 'Max', 'SMA', 'Dominant_Frequency', 'Total_Power', 'Loco_Power', 'Freeze_Power', 'Freeze_Index', 'Low_Freq_Ratio', 'PSE']
 SENSORS = ['Ankle', 'Thigh', 'Trunk']
 AXES = ['Forward', 'Vertical', 'Lateral']
@@ -994,6 +995,7 @@ def rf_train(args):
             manifest = meta.copy()
             manifest['Split'] = np.where(subjects == subject, 'test', 'train')
             pred = apply_median_postprocessing(manifest.iloc[test_rows], raw_pred, args.median_filter).astype(int)
+
             manifest.to_csv(folder / 'split_manifest.csv', index=False)
             table = manifest.iloc[test_rows].copy()
             table['Dataset_Row'] = test_rows
