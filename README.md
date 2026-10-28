@@ -1,12 +1,4 @@
-<<<<<<< HEAD
-=======
-[README.md](https://github.com/user-attachments/files/33922218/README.md)
->>>>>>> 869d9d20997134d92eca79561e18ec7ed7baa1fd
 # FOG Signal Analyzer — Daphnet, SVM, Random Forest và SHAP
-
-Ứng dụng desktop phân tích tín hiệu gia tốc Daphnet, tiền xử lý, trích xuất đặc trưng, xuất dữ liệu Batch, đánh giá mô hình theo bệnh nhân và xem kết quả SHAP.
-
-Hướng dẫn này dành cho app FOG v1.3 và bộ training đã gộp v3: **`train_fog.py`, `shap_fog.py`, `app_compare.py`**. Ví dụ dùng Windows PowerShell tại `E:\TEEP\FOG_Research`. Thay đường dẫn theo máy của bạn.
 
 ## 1. Các file cần có
 
