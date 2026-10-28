@@ -1,5 +1,5 @@
 """One batch/interactive export route. No GUI imports and no alternate algorithms."""
-RELEASE_VERSION = 'fog-unified-1.3-features'
+RELEASE_VERSION = 'fog-unified-1.4-cwt'
 import argparse
 import copy
 import json

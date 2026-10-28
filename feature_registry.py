@@ -2,7 +2,7 @@
 import numpy as np
 from scipy import signal, stats
 
-RELEASE_VERSION = 'fog-unified-1.3-features'
+RELEASE_VERSION = 'fog-unified-1.4-cwt'
 BASE = ['Mean','RMS','Std','Variance','Min','Max','SMA','Dominant_Frequency',
         'Total_Power','Loco_Power','Freeze_Power','Freeze_Index','Low_Freq_Ratio','PSE']
 GROUPS = {
@@ -15,6 +15,7 @@ GROUPS = {
     'corr': 'Within-sensor Pearson correlation (lag 0)',
     'crosscorr': 'Between-sensor magnitude cross-correlation',
     'ater': 'Log Ankle-to-Trunk energy ratio (loco / freeze)',
+    'cwt': 'CWT db4 FOG index (signed + absolute)',
 }
 AXES = ('Forward','Vertical','Lateral')
 SENSORS = ('Ankle','Thigh','Trunk')
@@ -61,6 +62,9 @@ def axis_names(config):
     if o['wavelet']:
         out += [f'Wavelet_D{level}_{stat}' for level in range(1,o['wavelet_level']+1) for stat in ('Energy','Relative_Energy','Std','Entropy')]
         if o['wavelet_level']>=4: out.append('Wavelet_D3_D4_Energy_Ratio')
+    if o['cwt']:
+        from cwt_features import FEATURE_NAMES
+        out += list(FEATURE_NAMES)
     return out
 
 def pairs(config):
@@ -153,6 +157,9 @@ def axis_extra(x,fs,config):
             ac=signal.correlate(xc,xc,mode='full',method='auto')[len(x)-1:]/energy
             k=lo+int(np.argmax(ac[lo:hi+1]));peak=float(ac[k]);lag=k/fs
         out.update(Autocorr_Peak=peak,Autocorr_Lag_s=lag)
+    if o['cwt']:
+        from cwt_features import features as cwt_features
+        out.update(cwt_features(x,fs))
     return out
 
 def corr(u,v):

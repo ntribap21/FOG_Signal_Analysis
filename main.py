@@ -1,7 +1,7 @@
 """FOG GUI: one processing pipeline; detect mixed modules before creating the GUI."""
 from pathlib import Path as _ReleasePath
 import importlib as _ReleaseImport
-RELEASE_VERSION = 'fog-unified-1.3-features'
+RELEASE_VERSION = 'fog-unified-1.4-cwt'
 
 def _load_matching_module(name):
     try:
@@ -15,6 +15,7 @@ def _load_matching_module(name):
 _processing_module = _load_matching_module('signal_processing')
 _preparation_module = _load_matching_module('data_prepare')
 _registry_module = _load_matching_module('feature_registry')
+_cwt_module = _load_matching_module('cwt_features')
 
 import sys
 import os
@@ -2404,6 +2405,8 @@ class FOGSignalAnalyzer(QMainWindow):
         extras=QGroupBox('ADDITIONAL FEATURE GROUPS');g=QGridLayout(extras);checks={}
         for i,(key,label) in enumerate(GROUPS.items()):
             w=QCheckBox(label);checks[key]=w;g.addWidget(w,i//2,i%2)
+            if key=='cwt':
+                w.setToolTip('db4; 0.5–3 / 3–8 Hz; 0.5 Hz step. Signed: paper ratio formula; may be unbounded or NaN. Absolute: a separate extension. Paper-like preprocessing: 64 Hz, low-pass 10 Hz/order 4, 2 s/50%. Enabling CWT does not change preprocessing.')
             if scope=='analysis' and key in ('crosscorr','ater'):
                 w.setEnabled(False);w.setToolTip('Use Batch with all three axes and the required sensors.')
             w.toggled.connect(lambda _=False,sc=scope:self._features_changed(sc))
@@ -2427,6 +2430,7 @@ class FOGSignalAnalyzer(QMainWindow):
                 w.setValue(default);w.valueChanged.connect(lambda _=None,sc=scope:self._features_changed(sc))
             params[key]=w;g.addWidget(QLabel(labels.get(key,key)),i//2,(i%2)*2);g.addWidget(w,i//2,(i%2)*2+1)
         layout.addWidget(settings)
+        layout.addWidget(self._note('CWT: db4, 0.5–3 / 3–8 Hz, step 0.5 Hz. Signed index follows the paper ratio; Abs index uses absolute coefficients (extension). Short-window boundary effects apply. Enable CWT explicitly; preprocessing is unchanged. Suggested paper settings: 64 Hz, low-pass 10 Hz/order 4, 2 s/50%.'))
         layout.addWidget(self._note('DWT bands depend on Fs. At 64 Hz: D3 ≈ 4–8 Hz, D4 ≈ 2–4 Hz. D3/D4 is not the 3–8 / 0.5–3 Hz Freeze Index. Harmonic ratio uses the configured fixed fundamental. Temporal features use past windows only and reset at segment boundaries. Undefined values remain NaN for train-fold imputation.'))
         setattr(self,scope+'_base_checks',basechecks);setattr(self,scope+'_feature_checks',checks);setattr(self,scope+'_feature_params',params)
         return box
@@ -2489,7 +2493,8 @@ class FOGSignalAnalyzer(QMainWindow):
         self.extra_feature_table.setRowCount(len(values))
         for row,(key,value) in enumerate(values.items()):
             normalized=key.replace(' ','_')
-            if normalized.endswith('Lag_s'):unit='s'
+            if normalized.startswith('CWT_FOG_Index_'):unit='%'
+            elif normalized.endswith('Lag_s'):unit='s'
             elif 'Relative_Energy' in normalized or 'Ratio' in normalized or 'Freeze_Index' in normalized or 'Entropy' in normalized or 'Skewness' in normalized or 'Kurtosis' in normalized or 'Corr' in normalized or 'Flatness' in normalized or 'Crest' in normalized:unit='—'
             elif normalized.endswith('Lag_s'):unit='s'
             elif 'Jerk' in normalized or 'Trend_g_s' in normalized:unit='g/s'

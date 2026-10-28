@@ -1,5 +1,5 @@
 """Single numerical pipeline shared by GUI, batch and CLI. Original formulas preserved."""
-RELEASE_VERSION = 'fog-unified-1.3-features'
+RELEASE_VERSION = 'fog-unified-1.4-cwt'
 import copy
 import hashlib
 import json
@@ -503,13 +503,18 @@ def _canonicalize_dict(config):
     result['feature_version'] = 'original14-welch64-bandfix-v2'
     fo=options(result)
     if any(fo[k] for k in GROUPS) or fo['base_features']!=BASE:
-        result['feature_options']=fo
+        result['feature_options']={k:v for k,v in fo.items() if k!='cwt' or v}
         result['feature_version']='selected-extended-v2'
         result['feature_names']=feature_names(result)
         result['undefined_feature_policy']='nan; train-fold median imputation with indicators; empty features -> 0'
     else:
         for key in ['feature_options','feature_names','undefined_feature_policy']: result.pop(key,None)
 
+    if fo['cwt']:
+        from cwt_features import settings as cwt_settings
+        result['cwt_settings']=cwt_settings(fs)
+    else:
+        result.pop('cwt_settings',None)
     if not feature_names(result): raise ValueError('Cần chọn ít nhất một đặc trưng.')
     if fo['wavelet']:
         pywt=wavelet_module();wavelet=pywt.Wavelet(fo['wavelet_name']);n=int(round(c['window_length_spinbox']*fs))

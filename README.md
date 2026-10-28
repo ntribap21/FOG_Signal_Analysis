@@ -1,4 +1,7 @@
+<<<<<<< HEAD
+=======
 [README.md](https://github.com/user-attachments/files/33922218/README.md)
+>>>>>>> 869d9d20997134d92eca79561e18ec7ed7baa1fd
 # FOG Signal Analyzer — Daphnet, SVM, Random Forest và SHAP
 
 Ứng dụng desktop phân tích tín hiệu gia tốc Daphnet, tiền xử lý, trích xuất đặc trưng, xuất dữ liệu Batch, đánh giá mô hình theo bệnh nhân và xem kết quả SHAP.

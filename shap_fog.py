@@ -141,6 +141,7 @@ def prepare_fold(root, directory, x, meta, names, config_ids):
     if not isinstance(bundle,dict) or 'pipeline' not in bundle:raise ValueError('Model bundle phải có pipeline.')
     if list(bundle.get('feature_names',[]))!=names:raise ValueError('Model và NPZ khác tên / thứ tự features.')
     model=bundle['pipeline']
+
     if not np.array_equal(np.asarray(model.classes_),np.array([0,1])):raise ValueError('SHAP yêu cầu model classes [0,1], score dương hướng FOG.')
     if set(bundle.get('test_subjects',test_subjects))!=test_subjects or set(bundle.get('train_subjects',train_subjects))!=train_subjects:raise ValueError('Model thuộc fold khác.')
     scores=prediction_scores(model,x[rows])
@@ -151,6 +152,7 @@ def prepare_fold(root, directory, x, meta, names, config_ids):
     thresholds=predictions.Decision_Threshold.to_numpy(float)
     if not np.isfinite(thresholds).all() or not np.allclose(thresholds,thresholds[0]):raise ValueError('Threshold không nhất quán trong fold.')
     pred=(scores>thresholds).astype(int)
+    
     if not np.array_equal(pred,predictions.Prediction.to_numpy(int)):raise ValueError('Prediction khác kết quả đã lưu.')
     return model,train,rows,predictions,scores,pred,thresholds
 

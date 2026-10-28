@@ -297,6 +297,52 @@ def _split(data, test_size, seed, test_subjects):
             raise ValueError(f'Tập {label} thiếu một lớp. Chỉ định --test-subjects theo thiết kế thí nghiệm; chương trình không tự thử seed đến khi đạt kết quả tốt.')
     return (train_idx, test_idx)
 
+from scipy.signal import medfilt
+
+def _positive_odd_int(value):
+  try:
+    k = int(value)
+  except ValueError as exc:
+    raise argparse.ArgumentTypeError(
+        'median-filter phải là số nguyên lẻ >= 1.'
+    ) from exc
+  if k < 1 or k % 2 == 0:
+    raise argparse.ArgumentTypeError(
+        'median-filter phải là số nguyên lẻ dương (1=tắt, 3, 5, 15, 31...).'
+    )
+  return k
+
+
+def apply_median_postprocessing(manifest_df, raw_predictions, kernel_size=1):
+  raw = np.asarray(raw_predictions, dtype=np.int8)
+  if kernel_size is None or int(kernel_size) <= 1:
+    return raw.copy()
+  kernel_size = int(kernel_size)
+  if kernel_size < 1 or kernel_size % 2 == 0:
+    raise ValueError('Kích thước median_filter phải là số nguyên lẻ >= 1.')
+  if len(manifest_df) != len(raw):
+    raise ValueError('Chiều dài manifest_df và raw_predictions không khớp.')
+
+  smoothed = raw.copy()
+  work = manifest_df[
+      ['Subject_ID', 'Recording_ID', 'Segment_ID', 'Window_ID']
+  ].copy()
+  work['_idx'] = np.arange(len(work))
+
+  for _, group in work.groupby(
+      ['Subject_ID', 'Recording_ID', 'Segment_ID'], sort=False
+  ):
+    ordered = group.sort_values('Window_ID', kind='stable')
+    idx = ordered['_idx'].to_numpy()
+    n = len(idx)
+    if n >= 3:
+      k = min(kernel_size, n if n % 2 == 1 else n - 1)
+      if k >= 3:
+        smoothed[idx] = medfilt(
+            smoothed[idx].astype(float), kernel_size=k
+        ).astype(np.int8)
+  return smoothed
+
 def diagnostic_metrics(y_true, y_pred):
     truth = np.asarray(y_true)
     predicted = np.asarray(y_pred)
@@ -405,14 +451,30 @@ def sweep_validation_thresholds(y, scores, *, min_sensitivity=0.85, min_specific
         selected = float(eligible.sort_values(['Sensitivity', 'Specificity', 'Decision_Threshold'], ascending=[False, False, False]).iloc[0].Decision_Threshold)
     return (table, selected)
 
-def _patient_metrics(y, scores, groups, threshold):
+def _patient_metrics(y, scores, groups, threshold, manifest_subset=None, median_filter=1):
     records = []
+    raw_all = (scores > threshold).astype(np.int8)
+    pred_all = apply_median_postprocessing(manifest_subset, raw_all, median_filter) if manifest_subset is not None else raw_all
     for subject in np.unique(groups):
         mask = groups == subject
         truth = y[mask]
-        prediction = (scores[mask] > threshold).astype(np.int8)
+        prediction = pred_all[mask]
         result = diagnostic_metrics(truth, prediction)
-        records.append({'Subject_ID': subject, 'Decision_Threshold': float(threshold), 'N_Windows': int(np.sum(mask)), 'N_FOG': int(np.sum(truth == 1)), 'Sensitivity': result['sensitivity'], 'Specificity': result['specificity'], 'Accuracy': result['accuracy'], 'PPV': result['ppv'], 'NPV': result['npv'], 'Youden_Index': result['youden_index'], 'F1_FOG': float(f1_score(truth, prediction, zero_division=0)), **result['confusion_counts']})
+        records.append({
+            'Subject_ID': subject,
+            'Decision_Threshold': float(threshold),
+            'Median_Filter_Window': int(median_filter),
+            'N_Windows': int(np.sum(mask)),
+            'N_FOG': int(np.sum(truth == 1)),
+            'Sensitivity': result['sensitivity'],
+            'Specificity': result['specificity'],
+            'Accuracy': result['accuracy'],
+            'PPV': result['ppv'],
+            'NPV': result['npv'],
+            'Youden_Index': result['youden_index'],
+            'F1_FOG': float(f1_score(truth, prediction, zero_division=0)),
+            **result['confusion_counts']
+        })
     return pd.DataFrame(records)
 
 def predict_with_threshold(bundle, X):
@@ -459,7 +521,7 @@ def _save_validation(output, manifest, train_idx, y, groups, scores, fold_ids, f
     _write_json(output / 'validation_metrics.json', summary)
     return summary
 
-def train(paths, output, test_size=0.25, seed=42, *, kernel='rbf', C=1.0, gamma='scale', tune=False, cv_folds=3, test_subjects=None, n_jobs=1, cache_size=512.0, decision_threshold=0.0, threshold_tuning=False, min_sensitivity=0.85, min_specificity=0.85, threshold_method='grid', threshold_min=-1.5, threshold_max=0.5, threshold_step=0.02, inner_cv_folds=3):
+def train(paths, output, test_size=0.25, seed=42, *, kernel='rbf', C=1.0, gamma='scale', tune=False, cv_folds=3, test_subjects=None, n_jobs=1, cache_size=512.0, decision_threshold=0.0, threshold_tuning=False, min_sensitivity=0.85, min_specificity=0.85, threshold_method='grid', threshold_min=-1.5, threshold_max=0.5, threshold_step=0.02, inner_cv_folds=3, median_filter=1):
     if kernel not in ('rbf', 'linear') or not np.isfinite(C) or C <= 0 or (not np.isfinite(cache_size)) or (cache_size <= 0):
         raise ValueError('Kernel phải là rbf/linear; C và cache-size phải >0.')
     if isinstance(gamma, (float, int)):
@@ -505,7 +567,10 @@ def train(paths, output, test_size=0.25, seed=42, *, kernel='rbf', C=1.0, gamma=
         print(f'Selected validation threshold: {decision_threshold:.8g}', flush=True)
     model, cv_results, best_params, best_score, final_cv_subjects = _fit_model(pipeline, X_train, y_train, train_groups, tune=tune, kernel=kernel, cv_folds=cv_folds, seed=seed, n_jobs=n_jobs)
     scores = model.decision_function(data['X'][test_idx])
-    prediction = (scores > decision_threshold).astype(np.int8)
+    raw_prediction = (scores > decision_threshold).astype(np.int8)
+    prediction = apply_median_postprocessing(
+        manifest.iloc[test_idx], raw_prediction, median_filter
+    )
     y_test = data['y'][test_idx]
     report = classification_report(y_test, prediction, labels=[0, 1], target_names=['Non-FOG', 'FOG'], output_dict=True, zero_division=0)
     metrics = {'model': 'SimpleImputer + StandardScaler + SVC', 'kernel': kernel, 'class_weight': 'balanced', 'decision_threshold': float(decision_threshold), 'seed': seed, 'status': 'completed', 'trainer_version': TRAINER_VERSION, 'threshold_selection': 'subject-grouped OOF validation' if threshold_tuning else 'fixed', 'threshold_tuning': bool(threshold_tuning), 'validation': validation_summary, 'accuracy': float(accuracy_score(y_test, prediction)), 'balanced_accuracy': float(balanced_accuracy_score(y_test, prediction)), 'fog_f1': float(f1_score(y_test, prediction, zero_division=0)), 'roc_auc': float(roc_auc_score(y_test, scores)), 'average_precision': float(average_precision_score(y_test, scores)), 'classification_report': report, 'confusion_matrix': confusion_matrix(y_test, prediction, labels=[0, 1]).tolist(), 'confusion_matrix_order': ['Non-FOG', 'FOG'], 'train_subjects': np.unique(train_groups).tolist(), 'test_subjects': np.unique(data['subject_id'][test_idx]).tolist(), 'train_windows': len(train_idx), 'test_windows': len(test_idx), 'n_features': len(names), 'tuning': bool(tune), 'cv_folds': cv_folds if tune else None, 'best_cv_fog_f1': best_score, 'best_params': best_params, 'svm_parameters': model.named_steps['svm'].get_params(), 'support_vectors': model.named_steps['svm'].n_support_.tolist(), 'config_verified': config['config_verified'], 'notes': config['notes'], 'evaluation': 'One held-out subject split. Tuning/scaler fit only on training subjects. Test never used for parameter selection.', 'versions': {'sklearn': sklearn.__version__, 'numpy': np.__version__, 'pandas': pd.__version__}}
@@ -526,6 +591,7 @@ def train(paths, output, test_size=0.25, seed=42, *, kernel='rbf', C=1.0, gamma=
     manifest = pd.DataFrame({'Subject_ID': data['subject_id'], 'Recording_ID': data['recording_id'], 'Segment_ID': data['segment_id'], 'Window_ID': data['window_id'], 'Start_Time': data['window_start'], 'End_Time': data['window_end'], 'Binary_Label': data['y'], 'Source_File': data['source_file'], 'Split': split})
     manifest.to_csv(output / 'split_manifest.csv', index=False)
     test_predictions = manifest.iloc[test_idx].copy()
+    test_predictions['Raw_Prediction'] = raw_prediction
     test_predictions['Prediction'] = prediction
     test_predictions['FOG_Decision_Score'] = scores
     test_predictions['Decision_Threshold'] = float(decision_threshold)
@@ -639,7 +705,7 @@ def _outer_metrics(y, prediction, scores=None):
     result.update(fog_f1=float(f1_score(y, prediction, zero_division=0)) if n_positive else None, balanced_accuracy=(result['sensitivity'] + result['specificity']) / 2 if both_classes else None, roc_auc=float(roc_auc_score(y, scores)) if both_classes and scores is not None else None, average_precision=float(average_precision_score(y, scores)) if both_classes and scores is not None else None, confusion_matrix=confusion_matrix(y, prediction, labels=[0, 1]).tolist(), confusion_matrix_order=['Non-FOG', 'FOG'])
     return result
 
-def train_loso(paths, output, *, kernel='rbf', C=1.0, gamma='scale', seed=42, tune=False, threshold_tuning=False, cv_folds=3, n_jobs=1, cache_size=512.0, decision_threshold=0.0, min_sensitivity=0.85, min_specificity=0.85, threshold_method='grid', threshold_min=-1.5, threshold_max=0.5, threshold_step=0.02, C_grid=None, gamma_grid=None, save_models=True, save_all_sweeps=False):
+def train_loso(paths, output, *, kernel='rbf', C=1.0, gamma='scale', seed=42, tune=False, threshold_tuning=False, cv_folds=3, n_jobs=1, cache_size=512.0, decision_threshold=0.0, min_sensitivity=0.85, min_specificity=0.85, threshold_method='grid', threshold_min=-1.5, threshold_max=0.5, threshold_step=0.02, C_grid=None, gamma_grid=None, save_models=True, save_all_sweeps=False, median_filter=1 ):
     _loso_options(kernel, C, gamma, cache_size, decision_threshold, min_sensitivity, min_specificity, n_jobs)
     if threshold_tuning and decision_threshold != 0.0:
         raise ValueError('Không đặt threshold khác 0 cùng chế độ tự chọn ngưỡng.')
@@ -664,7 +730,7 @@ def train_loso(paths, output, *, kernel='rbf', C=1.0, gamma='scale', seed=42, tu
     output.mkdir(parents=True, exist_ok=True)
     _write_json(output / 'dataset_info.json', config)
     _write_json(output / 'feature_names.json', names)
-    settings = {'model_type': 'svm', 'model_name': 'SVM', 'score_units': 'SVM decision score', 'evaluation': 'loso', 'trainer_version': TRAINER_VERSION, 'outer_folds': len(outer_folds), 'inner_cv': 'SGKF' if needs_inner else None, 'inner_cv_folds': cv_folds if needs_inner else None, 'cv_levels': 2 if needs_inner else 1, 'tune': bool(tune), 'threshold_tuning': bool(threshold_tuning), 'seed': seed, 'threshold_method': threshold_method, 'kernel': kernel, 'fixed_C': float(C), 'fixed_gamma': gamma, 'fixed_decision_threshold': float(decision_threshold), 'class_weight': 'balanced', 'cache_size': cache_size, 'n_jobs': n_jobs, 'versions': {'sklearn': sklearn.__version__, 'numpy': np.__version__, 'pandas': pd.__version__}, 'fallback_policy': 'best inner balanced accuracy when both targets cannot be met', 'n_features': len(names), 'input_files': config['input_files'], 'C_grid': C_grid if C_grid is not None else [0.1, 1.0, 10.0, 100.0], 'gamma_grid': gamma_grid if gamma_grid is not None else ['scale', 0.01, 0.1], 'min_sensitivity': min_sensitivity, 'min_specificity': min_specificity, 'threshold_grid': {'min': threshold_min, 'max': threshold_max, 'step': threshold_step}}
+    settings = {'model_type': 'svm', 'model_name': 'SVM', 'score_units': 'SVM decision score', 'evaluation': 'loso', 'trainer_version': TRAINER_VERSION, 'outer_folds': len(outer_folds), 'inner_cv': 'SGKF' if needs_inner else None, 'inner_cv_folds': cv_folds if needs_inner else None, 'cv_levels': 2 if needs_inner else 1, 'tune': bool(tune), 'threshold_tuning': bool(threshold_tuning), 'seed': seed, 'threshold_method': threshold_method, 'kernel': kernel, 'fixed_C': float(C), 'fixed_gamma': gamma, 'fixed_decision_threshold': float(decision_threshold), 'class_weight': 'balanced', 'cache_size': cache_size, 'n_jobs': n_jobs, 'versions': {'sklearn': sklearn.__version__, 'numpy': np.__version__, 'pandas': pd.__version__}, 'fallback_policy': 'best inner balanced accuracy when both targets cannot be met', 'n_features': len(names), 'input_files': config['input_files'], 'C_grid': C_grid if C_grid is not None else [0.1, 1.0, 10.0, 100.0], 'gamma_grid': gamma_grid if gamma_grid is not None else ['scale', 0.01, 0.1], 'min_sensitivity': min_sensitivity, 'min_specificity': min_specificity, 'threshold_grid': {'min': threshold_min, 'max': threshold_max, 'step': threshold_step, 'median_filter': int(median_filter) }}
     _write_json(output / 'run_settings.json', settings)
     _write_json(output / 'run_status.json', {'status': 'running', 'completed_subjects': []})
     pipeline = Pipeline([('imputer', SimpleImputer(strategy='median', add_indicator=True, keep_empty_features=True)), ('scaler', StandardScaler()), ('svm', SVC(kernel=kernel, C=C, gamma=gamma, class_weight='balanced', probability=False, cache_size=cache_size))])
@@ -691,16 +757,39 @@ def train_loso(paths, output, *, kernel='rbf', C=1.0, gamma='scale', seed=42, tu
             _write_json(directory / 'selected_parameters.json', selected)
         model = clone(pipeline).set_params(svm__C=selected['C'], svm__gamma=selected['gamma'])
         model.fit(X[train_idx], y[train_idx])
+
         scores = model.decision_function(X[test_idx])
         threshold = selected['decision_threshold']
-        predicted = (scores > threshold).astype(np.int8)
+        raw_predicted = (scores > threshold).astype(np.int8)
+        predicted = apply_median_postprocessing(
+            manifest.iloc[test_idx], raw_predicted, median_filter
+        )
+
         metrics = _outer_metrics(y[test_idx], predicted, scores)
         metrics.update(status='completed', evaluation='LOSO outer test', trainer_version=TRAINER_VERSION, test_subject=subject, train_subjects=np.unique(groups[train_idx]).tolist(), test_subjects=[subject], train_windows=len(train_idx), test_windows=len(test_idx), n_features=len(names), decision_threshold=float(threshold), selected_parameters=selected, svm_parameters=model.named_steps['svm'].get_params(), support_vectors=model.named_steps['svm'].n_support_.tolist())
+        metrics.update(
+            status='completed',
+            evaluation='LOSO outer test',
+            trainer_version=TRAINER_VERSION,
+            test_subject=subject,
+            train_subjects=np.unique(groups[train_idx]).tolist(),
+            test_subjects=[subject],
+            train_windows=len(train_idx),
+            test_windows=len(test_idx),
+            n_features=len(names),
+            decision_threshold=float(threshold),
+            median_filter=int(median_filter),
+            selected_parameters=selected,
+            svm_parameters=model.named_steps['svm'].get_params(),
+            support_vectors=model.named_steps['svm'].n_support_.tolist(),
+        )
         _write_json(directory / 'metrics.json', metrics)
         pred_table = manifest.iloc[test_idx].copy()
         pred_table['Dataset_Row'] = test_idx
         pred_table['Outer_Fold'] = fold
+        pred_table['Raw_Prediction'] = raw_predicted
         pred_table['Prediction'] = predicted
+        pred_table['Median_Filter_Window'] = int(median_filter)
         pred_table['FOG_Decision_Score'] = scores
         pred_table['Decision_Threshold'] = threshold
         pred_table['C'] = selected['C']
@@ -773,6 +862,7 @@ def svm_main(argv=None):
     parser.add_argument('--gamma-grid', nargs='+', type=_gamma, default=None, help='LOSO RBF --tune only; default scale .01 .1')
     parser.add_argument('--no-save-models', action='store_true', help='LOSO only: omit per-fold joblib models')
     parser.add_argument('--save-all-sweeps', action='store_true', help='LOSO: save threshold sweeps for every parameter candidate (can be large)')
+    parser.add_argument('--median-filter', type=_positive_odd_int, default=1, help='Cửa sổ lọc trung vị hậu xử lý theo Mazilu 2012 (1=tắt, 3, 5, 15, 31)',)
     args = parser.parse_args(argv)
     try:
         if args.evaluation == 'loso':
@@ -786,6 +876,7 @@ def svm_main(argv=None):
             raise ValueError('Grid tùy chỉnh và tùy chọn lưu model/sweep mới chỉ dùng trong LOSO.')
         paths = discover_inputs(args.input)
         common = dict(kernel=args.kernel, C=args.C, gamma=args.gamma, seed=args.seed, tune=args.tune, threshold_tuning=args.threshold_tuning, cv_folds=args.cv_folds, n_jobs=args.n_jobs, cache_size=args.cache_size, decision_threshold=args.decision_threshold, min_sensitivity=args.min_sensitivity, min_specificity=args.min_specificity, threshold_method=args.threshold_method, threshold_min=args.threshold_min, threshold_max=args.threshold_max, threshold_step=args.threshold_step)
+        median_filter = args.median_filter
         if args.evaluation == 'loso':
             metrics = train_loso(paths, args.output, **common, C_grid=args.C_grid, gamma_grid=args.gamma_grid, save_models=not args.no_save_models, save_all_sweeps=args.save_all_sweeps)
         else:
@@ -1004,6 +1095,7 @@ def rf_build_parser():
     p.add_argument('--rf-n-estimators-grid', type=rf_positive_integer, nargs='+', default=[200])
     p.add_argument('--rf-max-depth-grid', type=rf_depth, nargs='+', default=[None, 12])
     p.add_argument('--rf-min-samples-leaf-grid', type=rf_positive_integer, nargs='+', default=[1, 5])
+    p.add_argument('--median-filter', type=_positive_odd_int, default=1, help='Cửa sổ lọc trung vị hậu xử lý theo Mazilu 2012 (1=tắt, 3, 5, 15, 31)',)
     return p
 
 def rf_main(argv=None):
