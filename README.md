@@ -119,7 +119,10 @@ SVM là model mặc định, nên các lệnh cũ không có `--model svm` vẫn
 ```powershell
 python train_fog.py --model rf --input fog_batch.npz --output rf_2s_baseline --evaluation loso --rf-n-estimators 200 --rf-max-depth none --rf-min-samples-leaf 1 --decision-threshold 0.5
 ```
-
+-Trường hợp sử dụng AdaBoost
+```powershell
+python train_fog.py --model rf --use-adaboost --input fog_batch.npz --output ada_med3 --evaluation loso --rf-n-estimators 100 --median-filter 3
+```
 - Pipeline: imputer median giữ số chiều → Random Forest; không scaler và không thêm missing indicators.
 - FOG khi xác suất lớp FOG **lớn hơn 0,5**; bằng ngưỡng được tính Non-FOG.
 - Xác suất RF không mặc nhiên là xác suất đã hiệu chuẩn.

@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 import sklearn
 import argparse
+from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier
+from sklearn.tree import DecisionTreeClassifier
 from sklearn.base import clone
 from sklearn.metrics import accuracy_score, average_precision_score, balanced_accuracy_score, classification_report, confusion_matrix, f1_score, roc_auc_score
 from sklearn.model_selection import GridSearchCV, GroupShuffleSplit, StratifiedGroupKFold, LeaveOneGroupOut
@@ -910,9 +912,28 @@ def rf_diagnostic_metrics(y, pred, scores=None):
     return result
 
 def rf_make_model(args, params=None):
-    options = dict(n_estimators=args.rf_n_estimators, max_depth=args.rf_max_depth, min_samples_leaf=args.rf_min_samples_leaf, max_features=args.rf_max_features, class_weight=None if args.class_weight == 'none' else args.class_weight, random_state=args.seed, n_jobs=args.n_jobs)
-    options.update(params or {})
-    return Pipeline([('imputer', SimpleImputer(strategy='median', keep_empty_features=True)), ('rf', RandomForestClassifier(**options))])
+    if getattr(args, 'use_adaboost', False):
+        # Thiết lập cho AdaBoost
+        options = dict(n_estimators=args.rf_n_estimators, random_state=args.seed)
+        options.update(params or {})
+        
+        # AdaBoost thường dùng Cây Quyết Định gốc (Decision Stump, max_depth=1) làm thuật toán cơ sở
+        class_w = None if args.class_weight == 'none' else args.class_weight
+        base = DecisionTreeClassifier(max_depth=1, class_weight=class_w)
+        
+        # Đặt tên bước là 'rf' để các hàm phân tích khác không bị lỗi
+        return Pipeline([
+            ('imputer', SimpleImputer(strategy='median', keep_empty_features=True)), 
+            ('rf', AdaBoostClassifier(estimator=base, algorithm='SAMME', **options))
+        ])
+    else:
+        # Giữ nguyên thiết lập cũ của Random Forest
+        options = dict(n_estimators=args.rf_n_estimators, max_depth=args.rf_max_depth, min_samples_leaf=args.rf_min_samples_leaf, max_features=args.rf_max_features, class_weight=None if args.class_weight == 'none' else args.class_weight, random_state=args.seed, n_jobs=args.n_jobs)
+        options.update(params or {})
+        return Pipeline([
+            ('imputer', SimpleImputer(strategy='median', keep_empty_features=True)), 
+            ('rf', RandomForestClassifier(**options))
+        ])
 
 def rf_probability(model, x):
     if not np.array_equal(model.classes_, [0, 1]):
@@ -1083,6 +1104,7 @@ def rf_build_parser():
     p.add_argument('--rf-max-depth-grid', type=rf_depth, nargs='+', default=[None, 12])
     p.add_argument('--rf-min-samples-leaf-grid', type=rf_positive_integer, nargs='+', default=[1, 5])
     p.add_argument('--median-filter', type=_positive_odd_int, default=1)
+    p.add_argument('--use-adaboost', action='store_true', help='Chuyển sang dùng mô hình AdaBoost thay vì RF')
     return p
 
 def rf_main(argv=None):
