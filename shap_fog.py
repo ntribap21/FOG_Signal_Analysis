@@ -151,11 +151,12 @@ def prepare_fold(root, directory, x, meta, names, config_ids):
     if not np.allclose(scores,predictions[column].to_numpy(float),rtol=2e-4,atol=2e-5):raise ValueError('Score tính lại không khớp lần train; dùng đúng NPZ, model và môi trường sklearn.')
     thresholds=predictions.Decision_Threshold.to_numpy(float)
     if not np.isfinite(thresholds).all() or not np.allclose(thresholds,thresholds[0]):raise ValueError('Threshold không nhất quán trong fold.')
-    pred=(scores>thresholds).astype(int)
-    
-    if not np.array_equal(pred,predictions.Prediction.to_numpy(int)):raise ValueError('Prediction khác kết quả đã lưu.')
-    return model,train,rows,predictions,scores,pred,thresholds
-
+    raw_pred = (scores > thresholds).astype(int)
+    check_col = 'Raw_Prediction' if 'Raw_Prediction' in predictions.columns else 'Prediction'
+    if not np.array_equal(raw_pred, predictions[check_col].to_numpy(int)):
+        raise ValueError('Prediction khác kết quả đã lưu.')
+    pred = predictions.Prediction.to_numpy(int)
+    return model, train, rows, predictions, scores, pred, thresholds
 
 def explain_fold(root,directory,x,meta,names,config_ids,args):
     import shap
@@ -165,6 +166,7 @@ def explain_fold(root,directory,x,meta,names,config_ids,args):
     model,train,rows,predictions,scores,pred,thresholds=prepare_fold(root,directory,x,meta,names,config_ids)
     rng=np.random.default_rng(args.seed+int(predictions.Outer_Fold.iloc[0]))
     bg=select_balanced_background(train,meta,args.background,rng)
+    
     y=meta.iloc[rows].Binary_Label.to_numpy(int);outcomes=outcome_labels(y,pred)
     selected,weights=select_explained(rows,outcomes,args.explain,args.sampling,rng)
     chosen=rows[selected];background=x[bg];values=x[chosen]

@@ -15,6 +15,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.svm import SVC
+import argparsefrom scipy.signal import medfilt
 FEATURES = ['Mean', 'RMS', 'Std', 'Variance', 'Min', 'Max', 'SMA', 'Dominant_Frequency', 'Total_Power', 'Loco_Power', 'Freeze_Power', 'Freeze_Index', 'Low_Freq_Ratio', 'PSE']
 SENSORS = ['Ankle', 'Thigh', 'Trunk']
 AXES = ['Forward', 'Vertical', 'Lateral']
@@ -761,28 +762,9 @@ def train_loso(paths, output, *, kernel='rbf', C=1.0, gamma='scale', seed=42, tu
         scores = model.decision_function(X[test_idx])
         threshold = selected['decision_threshold']
         raw_predicted = (scores > threshold).astype(np.int8)
-        predicted = apply_median_postprocessing(
-            manifest.iloc[test_idx], raw_predicted, median_filter
-        )
-
+        predicted = apply_median_postprocessing(manifest.iloc[test_idx], raw_predicted, median_filter)       
         metrics = _outer_metrics(y[test_idx], predicted, scores)
-        metrics.update(status='completed', evaluation='LOSO outer test', trainer_version=TRAINER_VERSION, test_subject=subject, train_subjects=np.unique(groups[train_idx]).tolist(), test_subjects=[subject], train_windows=len(train_idx), test_windows=len(test_idx), n_features=len(names), decision_threshold=float(threshold), selected_parameters=selected, svm_parameters=model.named_steps['svm'].get_params(), support_vectors=model.named_steps['svm'].n_support_.tolist())
-        metrics.update(
-            status='completed',
-            evaluation='LOSO outer test',
-            trainer_version=TRAINER_VERSION,
-            test_subject=subject,
-            train_subjects=np.unique(groups[train_idx]).tolist(),
-            test_subjects=[subject],
-            train_windows=len(train_idx),
-            test_windows=len(test_idx),
-            n_features=len(names),
-            decision_threshold=float(threshold),
-            median_filter=int(median_filter),
-            selected_parameters=selected,
-            svm_parameters=model.named_steps['svm'].get_params(),
-            support_vectors=model.named_steps['svm'].n_support_.tolist(),
-        )
+        metrics.update(status='completed', evaluation='LOSO outer test', trainer_version=TRAINER_VERSION, test_subject=subject, train_subjects=np.unique(groups[train_idx]).tolist(), test_subjects=[subject], train_windows=len(train_idx), test_windows=len(test_idx), n_features=len(names), decision_threshold=float(threshold), median_filter_window=int(median_filter), selected_parameters=selected, svm_parameters=model.named_steps['svm'].get_params(), support_vectors=model.named_steps['svm'].n_support_.tolist())
         _write_json(directory / 'metrics.json', metrics)
         pred_table = manifest.iloc[test_idx].copy()
         pred_table['Dataset_Row'] = test_idx
@@ -862,7 +844,7 @@ def svm_main(argv=None):
     parser.add_argument('--gamma-grid', nargs='+', type=_gamma, default=None, help='LOSO RBF --tune only; default scale .01 .1')
     parser.add_argument('--no-save-models', action='store_true', help='LOSO only: omit per-fold joblib models')
     parser.add_argument('--save-all-sweeps', action='store_true', help='LOSO: save threshold sweeps for every parameter candidate (can be large)')
-    parser.add_argument('--median-filter', type=_positive_odd_int, default=1, help='Cửa sổ lọc trung vị hậu xử lý theo Mazilu 2012 (1=tắt, 3, 5, 15, 31)',)
+    parser.add_argument('--median-filter', type=_positive_odd_int, default=1, help='Cửa sổ lọc trung vị hậu xử lý theo Mazilu 2012 (1=tắt, 3, 5, 15, 31)')
     args = parser.parse_args(argv)
     try:
         if args.evaluation == 'loso':
@@ -989,7 +971,7 @@ def rf_train(args):
         with np.load(p, allow_pickle=False) as z:
             if 'config_json' in z:
                 configurations.append(json.loads(str(z['config_json'].item())))
-    settings = dict(evaluation='loso', trainer_version=RF_VERSION, model_type='rf', model_name='Random Forest', score_column='FOG_Probability', score_units='FOG probability', positive_class=1, fixed_decision_threshold=args.decision_threshold, prediction_rule='FOG iff probability > threshold', tune=args.tune, threshold_tuning=args.threshold_tuning, class_weight=args.class_weight, seed=args.seed, n_features=len(names), cv_levels=2 if args.tune or args.threshold_tuning else 1, rf_parameters=rf_make_model(args).named_steps['rf'].get_params(), versions=dict(sklearn=sklearn.__version__, numpy=np.__version__, pandas=pd.__version__))
+    settings = dict(evaluation='loso', trainer_version=RF_VERSION, model_type='rf', model_name='Random Forest', score_column='FOG_Probability', score_units='FOG probability', positive_class=1, fixed_decision_threshold=args.decision_threshold, prediction_rule='FOG iff probability > threshold', tune=args.tune, threshold_tuning=args.threshold_tuning, class_weight=args.class_weight, seed=args.seed, n_features=len(names), cv_levels=2 if args.tune or args.threshold_tuning else 1, rf_parameters=rf_make_model(args).named_steps['rf'].get_params(), versions=dict(sklearn=sklearn.__version__, numpy=np.__version__, pandas=pd.__version__, median_filter=args.median_filter))
     output.mkdir(parents=True, exist_ok=True)
     atomic_json(output / 'run_settings.json', settings)
     atomic_json(output / 'run_status.json', dict(status='running', completed_subjects=[]))
@@ -1006,16 +988,19 @@ def rf_train(args):
             model = rf_make_model(args, params)
             model.fit(x[train_rows], y[train_rows])
             scores = rf_probability(model, x[test_rows])
-            pred = (scores > threshold).astype(int)
+            raw_pred = (scores > threshold).astype(int)
             folder = output / f'fold_{i:02d}_{subject}'
             folder.mkdir()
             manifest = meta.copy()
             manifest['Split'] = np.where(subjects == subject, 'test', 'train')
+            pred = apply_median_postprocessing(manifest.iloc[test_rows], raw_pred, args.median_filter).astype(int)
             manifest.to_csv(folder / 'split_manifest.csv', index=False)
             table = manifest.iloc[test_rows].copy()
             table['Dataset_Row'] = test_rows
             table['Outer_Fold'] = i
+            table['Raw_Prediction'] = raw_pred
             table['Prediction'] = pred
+            table['Median_Filter_Window'] = int(args.median_filter)
             table['FOG_Probability'] = scores
             table['Decision_Threshold'] = threshold
             table['Model_Type'] = 'rf'
@@ -1095,7 +1080,7 @@ def rf_build_parser():
     p.add_argument('--rf-n-estimators-grid', type=rf_positive_integer, nargs='+', default=[200])
     p.add_argument('--rf-max-depth-grid', type=rf_depth, nargs='+', default=[None, 12])
     p.add_argument('--rf-min-samples-leaf-grid', type=rf_positive_integer, nargs='+', default=[1, 5])
-    p.add_argument('--median-filter', type=_positive_odd_int, default=1, help='Cửa sổ lọc trung vị hậu xử lý theo Mazilu 2012 (1=tắt, 3, 5, 15, 31)',)
+    p.add_argument('--median-filter', type=_positive_odd_int, default=1)
     return p
 
 def rf_main(argv=None):

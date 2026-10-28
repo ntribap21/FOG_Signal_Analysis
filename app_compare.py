@@ -29,7 +29,6 @@ LABELS = {
 COLORS = ['#2563eb', '#f97316', '#059669', '#9333ea',
           '#dc2626', '#0891b2', '#a16207', '#db2777']
 
-
 @dataclass
 class Run:
     name: str
@@ -44,7 +43,6 @@ class Run:
     @property
     def n(self):
         return sum(self.values[k] for k in COUNTS)
-
 
 def metrics(counts):
     c = {}
@@ -64,7 +62,6 @@ def metrics(counts):
                 fog_f1=div(2 * tp, 2 * tp + fp + fn),
                 balanced_accuracy=(sensitivity + specificity) / 2,
                 youden_index=sensitivity + specificity - 1)
-
 
 def load_runs(path):
     path = Path(path)
@@ -143,7 +140,6 @@ def load_runs(path):
         if archive:
             archive.close()
 
-
 @dataclass
 class ShapData:
     name: str
@@ -156,7 +152,6 @@ class ShapData:
     base: float
     weights: np.ndarray
     samples: list
-
 
 def read_shap_data(name, manifest, read_bytes, expected_names):
     import io
@@ -200,22 +195,17 @@ def read_shap_data(name, manifest, read_bytes, expected_names):
             raise ValueError('Metadata cửa sổ SHAP không khớp score.')
     return ShapData(manifest.get('fold', name), manifest, names, phi, values, scores, thresholds, base, weights, samples)
 
-
 def shap_indices(data, outcome='All'):
     return np.asarray([i for i, s in enumerate(data.samples) if outcome == 'All' or s['Outcome'] == outcome], int)
-
 
 def shap_importance(data, indices):
     return np.average(np.abs(data.phi[indices]), axis=0, weights=data.weights[indices])
 
-
 def shap_units(data):
     return data.manifest.get('score_units', 'SVM decision score')
 
-
 def model_label(run):
     return run.settings.get('model_name') or ('Random Forest' if run.settings.get('model_type') == 'rf' else 'SVM')
-
 
 def shap_bar(data, indices, k, sort_order='High → Low'):
     importance = shap_importance(data, indices)
@@ -237,7 +227,6 @@ def shap_bar(data, indices, k, sort_order='High → Low'):
     ax.grid(axis='x', alpha=0.2)
     ax.set_axisbelow(True)
     return f
-
 
 def shap_beeswarm(data, indices, k, sort_order='High → Low'):
     from matplotlib.colors import Normalize
@@ -274,7 +263,6 @@ def shap_beeswarm(data, indices, k, sort_order='High → Low'):
     cbar.set_ticks([0, 1], labels=['Low', 'High'])
     cbar.set_label('Feature value • scaled separately per feature')
     return f
-
 
 def shap_waterfall(data, index, k):
     phi = data.phi[index]
@@ -314,7 +302,6 @@ def shap_waterfall(data, index, k):
     ax.legend(fontsize=8, loc='upper left', bbox_to_anchor=(1.01, 1))
     return f
 
-
 def shap_stability(datasets, outcome, k, sort_order='High → Low'):
     valid = [(d, shap_indices(d, outcome)) for d in datasets]
     valid = [(d, i) for d, i in valid if len(i)]
@@ -344,12 +331,10 @@ def shap_stability(datasets, outcome, k, sort_order='High → Low'):
     ax.set_ylabel('Feature')
     return f
 
-
 def fig_base(title):
     f = Figure(figsize=(12, 6), dpi=100, layout='constrained')
     f.suptitle(title, fontsize=13, fontweight='bold', color='#183153')
     return f
-
 
 def grouped_chart(runs, keys, title, percent=False, delta=False, baseline=None):
     f = fig_base(title)
@@ -378,7 +363,6 @@ def grouped_chart(runs, keys, title, percent=False, delta=False, baseline=None):
     ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1), fontsize=9)
     return f
 
-
 def confusion_chart(runs, normalize=False):
     f = fig_base('Confusion matrix • ' + ('row normalized (%)' if normalize else 'window counts'))
     cols = min(3, len(runs))
@@ -404,14 +388,11 @@ def confusion_chart(runs, normalize=False):
         ax.set_visible(False)
     return f
 
-
 class Loader(QThread):
     loaded = Signal(object, object)
-
     def __init__(self, paths):
         super().__init__()
         self.paths = paths
-
     def run(self):
         runs, errors = [], []
         for path in self.paths:
@@ -421,10 +402,8 @@ class Loader(QThread):
                 errors.append(f'{Path(path).name}: {exc}')
         self.loaded.emit(runs, errors)
 
-
 class ViewToolbar(NavigationToolbar2QT):
     toolitems = tuple(item for item in NavigationToolbar2QT.toolitems if item[0] != 'Save')
-
 
 class PlotPane(QWidget):
     def __init__(self):
@@ -456,17 +435,14 @@ class PlotPane(QWidget):
         canvas.draw()
         scroll.verticalScrollBar().setValue(0)
 
-
 class NumericItem(QTableWidgetItem):
     def __init__(self, text, number=None):
         super().__init__(text)
         self.number = number
-
     def __lt__(self, other):
         if isinstance(other, NumericItem) and self.number is not None and other.number is not None:
             return self.number < other.number
         return super().__lt__(other)
-
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -715,7 +691,7 @@ class MainWindow(QMainWindow):
         self.shapmode = QComboBox()
         self.shapmode.addItems(['Importance', 'Beeswarm', 'Waterfall', 'Fold stability'])
         self.shaptop = QSpinBox()
-        self.shaptop.setRange(1, 200)
+        self.shaptop.setRange(1, 500)
         self.shaptop.setValue(20)
         self.shapsort = QComboBox()
         self.shapsort.addItems(['High → Low', 'Low → High'])
@@ -725,7 +701,7 @@ class MainWindow(QMainWindow):
         for title, control in [('Kết quả', self.shaprun), ('Fold / người', self.shapfold), ('Biểu đồ', self.shapmode)]:
             first.addWidget(QLabel(title))
             first.addWidget(control, 1)
-        for title, control in [('Số features (tối đa 200)', self.shaptop), ('Sắp xếp', self.shapsort), ('Nhóm', self.shapoutcome), ('Cửa sổ', self.shapwindow)]:
+        for title, control in [('Số features', self.shaptop), ('Sắp xếp', self.shapsort), ('Nhóm', self.shapoutcome), ('Cửa sổ', self.shapwindow)]:
             second.addWidget(QLabel(title))
             second.addWidget(control, 2 if control is self.shapwindow else 0)
         layout.addLayout(first)
@@ -813,7 +789,7 @@ class MainWindow(QMainWindow):
             f"outer test có {manifest.get('n_test_windows', '?')} cửa sổ · background {manifest.get('n_background', '?')} mẫu train · "
             f"sampling={manifest.get('sampling', '?')} · nsamples={manifest.get('nsamples', '?')} · l1_reg={manifest.get('l1_reg', '?')}. "
             'SHAP trên outer-test; thanh dài không có nghĩa feature tốt, SHAP=0 không chứng minh nhiễu. Không so trực tiếp độ lớn SHAP xác suất RF với decision score SVM. '
-            'Beeswarm phản ánh mẫu đã chọn, không có trọng số trên vị trí điểm. Không dùng biểu đồ này làm lựa chọn features rồi báo cùng test như độc lập.'
+            'Beeswarm phản ánh mẫu đã chọn, không có trọng số trên vị trí điểm.'
         )
         try:
             if mode == 3:
@@ -863,7 +839,7 @@ class MainWindow(QMainWindow):
             self.roc_note.setText(
                 f'ROC tạm tính từ {len(y_true):,} mẫu được lưu trong dữ liệu SHAP của {len(datasets)} fold. '
                 'Nếu SHAP được tạo bằng sampling (đặc biệt errors-balanced), phân bố mẫu không đại diện toàn bộ outer-test; '
-                'AUC này chỉ để quan sát, không dùng làm chỉ số đánh giá chính thức.'
+                'AUC này chỉ để quan sát.'
             )
             self.rocplot.show_figure(fig)
         except Exception as exc:
@@ -876,7 +852,6 @@ class MainWindow(QMainWindow):
         else:
             event.accept()
 
-
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
@@ -886,7 +861,6 @@ def main():
     if paths:
         QTimer.singleShot(100, lambda: window.load(paths))
     sys.exit(app.exec())
-
 
 if __name__ == '__main__':
     main()
