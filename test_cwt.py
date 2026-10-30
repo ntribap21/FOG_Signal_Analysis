@@ -80,7 +80,7 @@ class CWTTests(unittest.TestCase):
         self.assertEqual(new['controls'],old['controls'])
         self.assertNotEqual(new['config_id'],old['config_id'])
         self.assertIn('cwt_settings',new)
-        self.assertEqual(len(fr.feature_names(new)),144)
+        self.assertEqual(len(fr.feature_names(new)),132)
         self.assertEqual(sp.canonical_config(new)['config_id'],new['config_id'])
         new['feature_options']['cwt']=False;new=sp.canonical_config(new)
         self.assertNotIn('cwt_settings',new)

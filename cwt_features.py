@@ -64,6 +64,7 @@ def settings(fs):
     return dict(algorithm='db4-bin-integral-centered-zero-v1',
                 pywavelets_version=_pywt().__version__,
                 reference_doi='10.3390/s16040475', wavelet='db4',
+                target_axis='Forward (Anterior-Posterior only)',
                 wavelet_precision=PRECISION, fs_hz=float(fs),
                 central_frequency=fc, frequencies_hz=list(FREQUENCIES),
                 scales=scales.tolist(), loco_frequencies_hz=list(FREQUENCIES[:6]),

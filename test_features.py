@@ -36,7 +36,7 @@ class FeatureTests(unittest.TestCase):
         legacy={k:True for k in ['jerk','sampen','apen','autocorr','kurtosis','crest','corr','crosscorr','ater']}
         self.assertEqual(len(fr.feature_names(configuration(legacy))),206)
         self.assertEqual(len(fr.feature_names(configuration({k:True for k in fr.GROUPS if k!='cwt'}))),443)
-        self.assertEqual(len(fr.feature_names(configuration({k:True for k in fr.GROUPS}))),461)
+        self.assertEqual(len(fr.feature_names(configuration({k:True for k in fr.GROUPS}))),439)
         self.assertEqual(len(fr.feature_names(configuration({'base_features':['RMS','Freeze_Index']}))),18)
         with self.assertRaises(ValueError):configuration({'base_features':[]})
 
@@ -90,7 +90,7 @@ class FeatureTests(unittest.TestCase):
         c=configuration({k:True for k in fr.GROUPS});c['recording_id']='S01R01'
         items,meta=signals_and_metadata();preview=sp.gui_feature_rows(items,meta,64,c)
         wide,names=dp.wide_from_gui(preview,c)
-        self.assertEqual((len(wide),len(names)),(5,461))
+        self.assertEqual((len(wide),len(names)),(5,439))
         with tempfile.TemporaryDirectory() as td:
             dp.export_dataset(wide,names,c,Path(td)/'test')
             with np.load(Path(td)/'test.npz',allow_pickle=False) as z:

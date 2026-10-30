@@ -62,9 +62,6 @@ def axis_names(config):
     if o['wavelet']:
         out += [f'Wavelet_D{level}_{stat}' for level in range(1,o['wavelet_level']+1) for stat in ('Energy','Relative_Energy','Std','Entropy')]
         if o['wavelet_level']>=4: out.append('Wavelet_D3_D4_Energy_Ratio')
-    if o['cwt']:
-        from cwt_features import FEATURE_NAMES
-        out += list(FEATURE_NAMES)
     return out
 
 def pairs(config):
@@ -90,6 +87,11 @@ def window_names(config):
         if not {'Ankle','Trunk'}.issubset(config['sensors']) or set(config['axes'])!=set(AXES):
             raise ValueError('ATER cần Ankle + Trunk và đủ 3 trục; dùng Batch Configuration.')
         out.extend(['Ankle_Trunk_LogATER_Loco','Ankle_Trunk_LogATER_Freeze'])
+    if o['cwt']:
+        if 'Forward' not in config['axes']:
+            raise ValueError('Nhánh CWT yêu cầu phải chọn trục Forward (Anterior-Posterior).')
+        from cwt_features import FEATURE_NAMES
+        out.extend(f'{s}_Forward_{f}' for s in config['sensors'] for f in FEATURE_NAMES)
     return out
 
 def feature_names(config):
@@ -157,9 +159,6 @@ def axis_extra(x,fs,config):
             ac=signal.correlate(xc,xc,mode='full',method='auto')[len(x)-1:]/energy
             k=lo+int(np.argmax(ac[lo:hi+1]));peak=float(ac[k]);lag=k/fs
         out.update(Autocorr_Peak=peak,Autocorr_Lag_s=lag)
-    if o['cwt']:
-        from cwt_features import features as cwt_features
-        out.update(cwt_features(x,fs))
     return out
 
 def corr(u,v):
@@ -204,6 +203,14 @@ def window_extra(signals,fs,config,channel_values):
             ea=sum(channel_values[('Ankle',a)][key] for a in AXES)
             et=sum(channel_values[('Trunk',a)][key] for a in AXES)
             ep=o['ater_epsilon_g2'];out[f'Ankle_Trunk_LogATER_{band}']=float(np.log((ea+ep)/(et+ep)))
+    if o['cwt']:
+        if 'Forward' not in config['axes']:
+            raise ValueError('Nhánh CWT yêu cầu phải chọn trục Forward (Anterior-Posterior).')
+        from cwt_features import features as cwt_features
+        for s in config['sensors']:
+            cwt_vals = cwt_features(signals[f'{s}_Forward_mg'], fs)
+            for k, v in cwt_vals.items():
+                out[f'{s}_Forward_{k}'] = v
     return out
 
 
