@@ -26,106 +26,6 @@ AXES = ['Forward', 'Vertical', 'Lateral']
 ALIASES = {'subject_id': 'Subject_ID', 'Subject': 'Subject_ID', 'recording_id': 'Recording_ID', 'Recording': 'Recording_ID', 'segment_id': 'Segment_ID', 'window_id': 'Window_ID', 'window_start': 'Start_Time', 'window_end': 'End_Time', 'fog_ratio': 'FOG_Ratio', 'config_id': 'Config_ID', 'y': 'Binary_Label'}
 META = ['Subject_ID', 'Recording_ID', 'Segment_ID', 'Window_ID', 'Start_Time', 'End_Time']
 
-class CFSSelector(BaseEstimator, TransformerMixin):
-    """Correlation-based Feature Subset Selection (Hall 1999 / Mazilu 2012).
-    Tối đa hóa hệ số Merit: M_S = (k * r_cf) / sqrt(k + k * (k - 1) * r_ff)
-    bằng tìm kiếm tiến (Forward Best-First Search) độc lập trên từng tập train.
-    """
-    def __init__(self, max_features=30, min_backtrack=5):
-        self.max_features = max_features
-        self.min_backtrack = min_backtrack
-
-    def fit(self, X, y):
-        X = np.asarray(X, dtype=float)
-        y = np.asarray(y, dtype=float).ravel()
-        n_samples, n_features = X.shape
-        if n_features == 0:
-            raise ValueError('CFSSelector nhận ma trận X rỗng.')
-
-        # Chuẩn hóa Z-score trên từng cột để tính nhanh ma trận tương quan Pearson bằng tích vô hướng
-        x_mean = np.nanmean(X, axis=0)
-        X_centered = np.where(np.isnan(X), 0.0, X - x_mean)
-        x_std = np.sqrt(np.sum(X_centered ** 2, axis=0))
-        valid_cols = x_std > 1e-12
-
-        X_norm = np.zeros_like(X_centered)
-        X_norm[:, valid_cols] = X_centered[:, valid_cols] / x_std[valid_cols]
-
-        y_centered = y - np.mean(y)
-        y_std = np.sqrt(np.sum(y_centered ** 2))
-        if y_std <= 1e-12:
-            raise ValueError('Nhãn y trong tập fit đồng nhất, không thể tính tương quan CFS.')
-        y_norm = y_centered / y_std
-
-        # Tương quan giữa từng đặc trưng với nhãn FOG: r_cf
-        r_cf = np.abs(X_norm.T @ y_norm)
-        r_cf[~valid_cols] = 0.0
-
-        # Ma trận tương quan giữa các đặc trưng với nhau: r_ff
-        r_ff = np.abs(X_norm.T @ X_norm)
-        np.fill_diagonal(r_ff, 0.0)
-
-        limit = min(int(self.max_features), int(np.sum(valid_cols))) if self.max_features else int(np.sum(valid_cols))
-        if limit < 1:
-            self.support_mask_ = np.ones(n_features, dtype=bool)
-            self.selected_indices_ = np.arange(n_features, dtype=int)
-            return self
-
-        selected = []
-        best_selected = []
-        best_merit = -1.0
-        stagnation = 0
-        remaining = set(np.flatnonzero(valid_cols).tolist())
-
-        sum_rcf = 0.0
-        sum_rff = 0.0
-
-        while remaining and len(selected) < limit:
-            k = len(selected) + 1
-            best_cand = None
-            best_cand_merit = -1.0
-            best_cand_rff = 0.0
-
-            for c in remaining:
-                cand_rcf = sum_rcf + r_cf[c]
-                cand_rff = sum_rff + (float(np.sum(r_ff[c, selected])) if selected else 0.0)
-                denom = np.sqrt(k + 2.0 * cand_rff)
-                merit = (cand_rcf / denom) if denom > 1e-12 else 0.0
-                if merit > best_cand_merit:
-                    best_cand_merit = merit
-                    best_cand = c
-                    best_cand_rff = cand_rff
-
-            if best_cand is None:
-                break
-
-            selected.append(best_cand)
-            remaining.remove(best_cand)
-            sum_rcf += r_cf[best_cand]
-            sum_rff = best_cand_rff
-
-            if best_cand_merit > best_merit + 1e-6:
-                best_merit = best_cand_merit
-                best_selected = list(selected)
-                stagnation = 0
-            else:
-                stagnation += 1
-                if stagnation >= self.min_backtrack:
-                    break
-
-        if not best_selected:
-            best_selected = [int(np.argmax(r_cf))]
-
-        self.selected_indices_ = np.sort(np.asarray(best_selected, dtype=int))
-        self.support_mask_ = np.zeros(n_features, dtype=bool)
-        self.support_mask_[self.selected_indices_] = True
-        self.best_merit_ = float(best_merit)
-        return self
-
-    def transform(self, X):
-        X = np.asarray(X, dtype=float)
-        return X[:, self.support_mask_]
-
 def discover_inputs(inputs):
     result = []
     for item in inputs:
@@ -544,9 +444,24 @@ def diagnostic_metrics(y_true, y_pred):
 
     def ratio(numerator, denominator):
         return float(numerator / denominator) if denominator else None
+
     sensitivity = ratio(tp, tp + fn)
     specificity = ratio(tn, tn + fp)
-    return {'sensitivity': sensitivity, 'specificity': specificity, 'ppv': ratio(tp, tp + fp), 'npv': ratio(tn, tn + fn), 'accuracy': ratio(tp + tn, tp + tn + fp + fn), 'youden_index': sensitivity + specificity - 1.0 if sensitivity is not None and specificity is not None else None, 'confusion_counts': {'TN': tn, 'FP': fp, 'FN': fn, 'TP': tp}, 'positive_class': 'FOG (1)', 'evaluation_unit': 'window', 'undefined_metric_policy': 'JSON null if denominator is zero; classification_report retains sklearn zero_division=0.'}
+    gm = float(np.sqrt(sensitivity * specificity)) if sensitivity is not None and specificity is not None else None
+    return {
+        'sensitivity': sensitivity,
+        'specificity': specificity,
+        'geometric_mean': gm,
+        'ppv': ratio(tp, tp + fp),
+        'npv': ratio(tn, tn + fn),
+        'accuracy': ratio(tp + tn, tp + tn + fp + fn),
+        'youden_index': sensitivity + specificity - 1.0 if sensitivity is not None and specificity is not None else None,
+        'confusion_counts': {'TN': tn, 'FP': fp, 'FN': fn, 'TP': tp},
+        'positive_class': 'FOG (1)',
+        'evaluation_unit': 'window',
+        'undefined_metric_policy': 'JSON null if denominator is zero; classification_report retains sklearn zero_division=0.',
+    }
+
 TRAINER_VERSION = 'fog-unified-v3-svm-loso-2level-1'
 
 def _write_json(path, value):
@@ -634,7 +549,14 @@ def sweep_validation_thresholds(y, scores, *, min_sensitivity=0.85, min_specific
     ppv = np.divide(tp, tp + fp, out=np.full(len(tp), np.nan), where=tp + fp != 0)
     npv = np.divide(tn, tn + fn, out=np.full(len(tp), np.nan), where=tn + fn != 0)
     f1 = 2 * tp / (2 * tp + fp + fn)
-    table = pd.DataFrame({'Decision_Threshold': thresholds, 'Sensitivity': sens, 'Specificity': spec, 'Accuracy': (tp + tn) / len(y), 'PPV': ppv, 'NPV': npv, 'F1_FOG': f1, 'Balanced_Accuracy': (sens + spec) / 2, 'Youden_Index': sens + spec - 1, 'TN': tn, 'FP': fp, 'FN': fn, 'TP': tp, 'Meets_Target': (sens >= min_sensitivity) & (spec >= min_specificity)})
+    gm = np.sqrt(sens * spec)
+    table = pd.DataFrame({
+        'Decision_Threshold': thresholds, 'Sensitivity': sens, 'Specificity': spec,
+        'Geometric_Mean': gm, 'Accuracy': (tp + tn) / len(y), 'PPV': ppv, 'NPV': npv,
+        'F1_FOG': f1, 'Balanced_Accuracy': (sens + spec) / 2, 'Youden_Index': sens + spec - 1,
+        'TN': tn, 'FP': fp, 'FN': fn, 'TP': tp,
+        'Meets_Target': (sens >= min_sensitivity) & (spec >= min_specificity)
+    })
     eligible = table[table.Meets_Target]
     selected = None
     if not eligible.empty:
@@ -711,7 +633,7 @@ def _save_validation(output, manifest, train_idx, y, groups, scores, fold_ids, f
     _write_json(output / 'validation_metrics.json', summary)
     return summary
 
-def train(paths, output, test_size=0.25, seed=42, *, kernel='rbf', C=1.0, gamma='scale', tune=False, cv_folds=3, test_subjects=None, n_jobs=1, cache_size=512.0, decision_threshold=0.0, threshold_tuning=False, min_sensitivity=0.85, min_specificity=0.85, threshold_method='grid', threshold_min=-1.5, threshold_max=0.5, threshold_step=0.02, inner_cv_folds=3, median_filter=1, cfs=False, cfs_max_features=30):
+def train(paths, output, test_size=0.25, seed=42, *, kernel='rbf', C=1.0, gamma='scale', tune=False, cv_folds=3, test_subjects=None, n_jobs=1, cache_size=512.0, decision_threshold=0.0, threshold_tuning=False, min_sensitivity=0.85, min_specificity=0.85, threshold_method='grid', threshold_min=-1.5, threshold_max=0.5, threshold_step=0.02, inner_cv_folds=3, median_filter=1, cfs=False, cfs_max_features=30, class_weight='balanced', fog_weight_ratio=None):
     if kernel not in ('rbf', 'linear') or not np.isfinite(C) or C <= 0 or (not np.isfinite(cache_size)) or (cache_size <= 0):
         raise ValueError('Kernel phải là rbf/linear; C và cache-size phải >0.')
     if isinstance(gamma, (float, int)):
@@ -730,6 +652,7 @@ def train(paths, output, test_size=0.25, seed=42, *, kernel='rbf', C=1.0, gamma=
         raise ValueError('Chọn thư mục output mới/rỗng cho validation để tránh trộn kết quả cũ.')
     data, names, config = load_datasets(paths)
     cfs, cfs_max_features = _resolve_cfs_from_config(config, cfs, cfs_max_features)
+    resolved_cw = _resolve_svm_class_weight(class_weight, fog_weight_ratio)
     train_idx, test_idx = _split(data, test_size, seed, test_subjects)
     steps = [
         ('imputer', SimpleImputer(strategy='median', add_indicator=True, keep_empty_features=True)),
@@ -737,7 +660,7 @@ def train(paths, output, test_size=0.25, seed=42, *, kernel='rbf', C=1.0, gamma=
     ]
     if cfs:
         steps.append(('cfs', CFSSelector(max_features=cfs_max_features)))
-    steps.append(('svm', SVC(kernel=kernel, C=C, gamma=gamma, class_weight='balanced', probability=False, cache_size=cache_size)))
+    steps.append(('svm', SVC(kernel=kernel, C=C, gamma=gamma, class_weight=resolved_cw, probability=False, cache_size=cache_size)))
     pipeline = Pipeline(steps)
     X_train, y_train = (data['X'][train_idx], data['y'][train_idx])
     train_groups = data['subject_id'][train_idx]
@@ -829,7 +752,51 @@ def _candidate_scores(pipeline, X, y, folds, params):
         raise ValueError('Có cửa sổ thiếu score SGKF.')
     return scores
 
-def select_joint_parameters(pipeline, X, y, groups, *, tune=False, threshold_tuning=False, cv_folds=3, seed=42, kernel='rbf', decision_threshold=0.0, min_sensitivity=0.85, min_specificity=0.85, threshold_method='grid', threshold_min=-1.5, threshold_max=0.5, threshold_step=0.02, C_grid=None, gamma_grid=None, n_jobs=1, save_all_sweeps=False, output=None):
+def _resolve_svm_class_weight(class_weight, fog_penalty=None):
+    """Hỗ trợ đối chứng Weighted SVM (Ahlrichs 2016):
+    - 'balanced': C+ / C- = N_non_fog / N_fog tự động theo từng fold.
+    - 'none': C+ = C- (SVM tiêu chuẩn không phạt lệch).
+    - fog_penalty > 0: đặt trực tiếp tỷ lệ phạt {0: 1.0, 1: fog_penalty}.
+    """
+    if fog_penalty is not None:
+        if not np.isfinite(fog_penalty) or fog_penalty <= 0:
+            raise ValueError('--fog-weight-ratio phải là số dương hữu hạn.')
+        return {0: 1.0, 1: float(fog_penalty)}
+    if class_weight == 'none':
+        return None
+    if class_weight == 'balanced':
+        return 'balanced'
+    raise ValueError("class_weight cho SVM phải là 'balanced' hoặc 'none'.")
+
+
+def _inner_fold_gm_stats(y, scores, folds, threshold):
+    """Bước 3 & Bước 4:
+    - Bước 3: Lấy dự đoán OOF trên từng inner validation fold và tính Sens_i, Spec_i.
+    - Bước 4: Tính trung bình Sens và Spec giữa các inner folds, sau đó tính GM = sqrt(Mean_Sens * Mean_Spec).
+    """
+    sens_list, spec_list, fold_gms = [], [], []
+    pred_all = (np.asarray(scores, dtype=float) > float(threshold)).astype(np.int8)
+    for _, val_idx in folds:
+        m = diagnostic_metrics(y[val_idx], pred_all[val_idx])
+        if m['sensitivity'] is not None:
+            sens_list.append(m['sensitivity'])
+        if m['specificity'] is not None:
+            spec_list.append(m['specificity'])
+        if m['geometric_mean'] is not None:
+            fold_gms.append(m['geometric_mean'])
+    mean_sens = float(np.mean(sens_list)) if sens_list else 0.0
+    mean_spec = float(np.mean(spec_list)) if spec_list else 0.0
+    gm_from_fold_means = float(np.sqrt(mean_sens * mean_spec))
+    mean_fold_gm = float(np.mean(fold_gms)) if fold_gms else 0.0
+    return {
+        'Inner_Fold_Mean_Sensitivity': mean_sens,
+        'Inner_Fold_Mean_Specificity': mean_spec,
+        'GM_Fold_Mean': gm_from_fold_means,
+        'Mean_Per_Fold_GM': mean_fold_gm,
+    }
+
+def select_joint_parameters(pipeline, X, y, groups, *, tune=False, threshold_tuning=False, cv_folds=3, seed=42, kernel='rbf', decision_threshold=0.0, min_sensitivity=0.85, min_specificity=0.85, threshold_method='grid', threshold_min=-1.5, threshold_max=0.5, threshold_step=0.02, C_grid=None, gamma_grid=None, n_jobs=1, save_all_sweeps=False, output=None, selection_metric='gm'):
+    # Bước 1: Tạo inner SGKF trên tập outer training subjects
     folds = _group_folds(X, y, groups, cv_folds, seed)
     base = pipeline.get_params()
     c_values = list(C_grid if C_grid is not None else [0.1, 1.0, 10.0, 100.0]) if tune else [base['svm__C']]
@@ -846,27 +813,50 @@ def select_joint_parameters(pipeline, X, y, groups, *, tune=False, threshold_tun
     for fold, (a, b) in enumerate(folds, 1):
         fold_ids[b] = fold
         fold_rows.append({'Fold': fold, 'Fit_Subjects': ','.join(np.unique(groups[a])), 'Validation_Subjects': ','.join(np.unique(groups[b])), 'Fit_Windows': len(a), 'Validation_Windows': len(b)})
-    print(f'Inner SGKF: {len(params_list)} candidates × {len(folds)} folds.', flush=True)
+    print(f'Inner SGKF: {len(params_list)} candidates × {len(folds)} folds (metric={selection_metric}).', flush=True)
+
+    # Bước 2: Chạy từng tổ hợp C và gamma trên các inner folds để lấy dự đoán OOF
     if n_jobs == 1:
         all_scores = [_candidate_scores(pipeline, X, y, folds, params) for params in params_list]
     else:
         all_scores = joblib.Parallel(n_jobs=n_jobs)((joblib.delayed(_candidate_scores)(pipeline, X, y, folds, params) for params in params_list))
+
     candidate_rows, sweeps = ([], [])
     for i, (params, scores) in enumerate(zip(params_list, all_scores), 1):
         if threshold_tuning:
             sweep, selected = sweep_validation_thresholds(y, scores, min_sensitivity=min_sensitivity, min_specificity=min_specificity, method=threshold_method, threshold_min=threshold_min, threshold_max=threshold_max, threshold_step=threshold_step)
             if selected is not None:
                 row = sweep.loc[sweep.Decision_Threshold == selected].iloc[0]
+            elif selection_metric == 'gm':
+                row = sweep.sort_values(['Geometric_Mean', 'Balanced_Accuracy', 'F1_FOG', 'Decision_Threshold'], ascending=[False, False, False, False]).iloc[0]
             else:
                 row = sweep.sort_values(['Balanced_Accuracy', 'F1_FOG', 'Specificity', 'Decision_Threshold'], ascending=[False, False, False, False]).iloc[0]
             record = {k: row[k].item() if hasattr(row[k], 'item') else row[k] for k in sweep.columns}
             record['Target_Met'] = selected is not None
-            record['Threshold_Role'] = 'target_met' if selected is not None else 'fallback_best_balanced'
+            record['Threshold_Role'] = 'target_met' if selected is not None else f'fallback_best_{selection_metric}'
         else:
             pred = (scores > decision_threshold).astype(np.int8)
             result = diagnostic_metrics(y, pred)
-            record = {'Decision_Threshold': float(decision_threshold), 'Sensitivity': result['sensitivity'], 'Specificity': result['specificity'], 'Accuracy': result['accuracy'], 'PPV': result['ppv'], 'NPV': result['npv'], 'F1_FOG': float(f1_score(y, pred, zero_division=0)), 'Balanced_Accuracy': (result['sensitivity'] + result['specificity']) / 2, 'Youden_Index': result['youden_index'], **result['confusion_counts'], 'Target_Met': None, 'Threshold_Role': 'fixed_threshold'}
+            record = {
+                'Decision_Threshold': float(decision_threshold),
+                'Sensitivity': result['sensitivity'],
+                'Specificity': result['specificity'],
+                'Geometric_Mean': result['geometric_mean'],
+                'Accuracy': result['accuracy'],
+                'PPV': result['ppv'],
+                'NPV': result['npv'],
+                'F1_FOG': float(f1_score(y, pred, zero_division=0)),
+                'Balanced_Accuracy': (result['sensitivity'] + result['specificity']) / 2,
+                'Youden_Index': result['youden_index'],
+                **result['confusion_counts'],
+                'Target_Met': None,
+                'Threshold_Role': 'fixed_threshold',
+            }
             sweep = pd.DataFrame([record])
+
+        # Bước 3 & Bước 4: Tính Sensitivity, Specificity trên từng inner validation fold -> lấy trung bình -> tính GM
+        fold_gm_info = _inner_fold_gm_stats(y, scores, folds, record['Decision_Threshold'])
+        record.update(fold_gm_info)
         record.update(Candidate_ID=i, C=params['svm__C'], Gamma=params['svm__gamma'])
         candidate_rows.append(record)
         sweeps.append(sweep)
@@ -874,20 +864,53 @@ def select_joint_parameters(pipeline, X, y, groups, *, tune=False, threshold_tun
             directory = Path(output) / 'candidate_threshold_sweeps'
             directory.mkdir(exist_ok=True)
             sweep.to_csv(directory / f'candidate_{i:02d}.csv', index=False)
+
     candidates = pd.DataFrame(candidate_rows)
+
+    # Bước 5: Chọn tổ hợp C/gamma có GM cao nhất (hoặc đối chứng với f1 / balanced_accuracy)
     if threshold_tuning:
         eligible = candidates[candidates.Target_Met == True]
         if not eligible.empty:
-            chosen = eligible.sort_values(['Sensitivity', 'Specificity', 'Candidate_ID'], ascending=[False, False, True]).iloc[0]
-            selection_rule = 'max sensitivity satisfying both targets; ties: specificity, candidate order'
+            sort_cols = ['GM_Fold_Mean', 'Geometric_Mean', 'Sensitivity', 'Specificity', 'Candidate_ID'] if selection_metric == 'gm' else ['Sensitivity', 'Specificity', 'Candidate_ID']
+            asc = [False] * (len(sort_cols) - 1) + [True]
+            chosen = eligible.sort_values(sort_cols, ascending=asc).iloc[0]
+            selection_rule = f'target met + max {selection_metric}'
         else:
-            chosen = candidates.sort_values(['Balanced_Accuracy', 'F1_FOG', 'Specificity', 'Candidate_ID'], ascending=[False, False, False, True]).iloc[0]
-            selection_rule = 'targets unmet: best balanced accuracy; ties: F1, specificity, candidate order'
+            primary = 'GM_Fold_Mean' if selection_metric == 'gm' else ('F1_FOG' if selection_metric == 'f1' else 'Balanced_Accuracy')
+            chosen = candidates.sort_values([primary, 'Geometric_Mean', 'Balanced_Accuracy', 'Specificity', 'Candidate_ID'], ascending=[False, False, False, False, True]).iloc[0]
+            selection_rule = f'targets unmet: best {primary}; ties: Geometric_Mean, Balanced_Accuracy, Specificity'
     else:
-        chosen = candidates.sort_values(['F1_FOG', 'Specificity', 'Candidate_ID'], ascending=[False, False, True]).iloc[0]
-        selection_rule = 'max pooled inner OOF F1 at fixed threshold; ties: specificity, candidate order'
+        if selection_metric == 'gm':
+            chosen = candidates.sort_values(['GM_Fold_Mean', 'Geometric_Mean', 'Inner_Fold_Mean_Sensitivity', 'Inner_Fold_Mean_Specificity', 'Candidate_ID'], ascending=[False, False, False, False, True]).iloc[0]
+            selection_rule = 'max inner fold-mean Geometric Mean (sqrt(mean_Sens * mean_Spec)); ties: pooled GM, sensitivity, specificity'
+        elif selection_metric == 'balanced_accuracy':
+            chosen = candidates.sort_values(['Balanced_Accuracy', 'GM_Fold_Mean', 'Specificity', 'Candidate_ID'], ascending=[False, False, False, True]).iloc[0]
+            selection_rule = 'max inner OOF Balanced Accuracy; ties: GM_Fold_Mean, specificity'
+        else:
+            chosen = candidates.sort_values(['F1_FOG', 'Specificity', 'Candidate_ID'], ascending=[False, False, True]).iloc[0]
+            selection_rule = 'max pooled inner OOF F1 at fixed threshold; ties: specificity, candidate order'
+
     chosen_id = int(chosen.Candidate_ID)
-    summary = {'candidate_id': chosen_id, 'C': float(chosen.C), 'gamma': chosen.Gamma, 'decision_threshold': float(chosen.Decision_Threshold), 'target_met': bool(chosen.Target_Met) if threshold_tuning else None, 'threshold_role': chosen.Threshold_Role, 'selection_rule': selection_rule, 'cv_folds': cv_folds, 'n_candidates': len(candidates), 'targets': {'min_sensitivity': min_sensitivity, 'min_specificity': min_specificity} if threshold_tuning else None, 'threshold_method': threshold_method if threshold_tuning else 'fixed', 'inner_metrics_are_for_selection_only': True, 'score_scale_note': 'Each fold fits its own SVM; refitting may change score scale.'}
+    summary = {
+        'candidate_id': chosen_id,
+        'C': float(chosen.C),
+        'gamma': chosen.Gamma,
+        'decision_threshold': float(chosen.Decision_Threshold),
+        'selection_metric': selection_metric,
+        'inner_fold_mean_sensitivity': float(chosen.Inner_Fold_Mean_Sensitivity),
+        'inner_fold_mean_specificity': float(chosen.Inner_Fold_Mean_Specificity),
+        'inner_gm_fold_mean': float(chosen.GM_Fold_Mean),
+        'inner_gm_pooled': float(chosen.Geometric_Mean) if chosen.Geometric_Mean is not None else None,
+        'target_met': bool(chosen.Target_Met) if threshold_tuning else None,
+        'threshold_role': chosen.Threshold_Role,
+        'selection_rule': selection_rule,
+        'cv_folds': cv_folds,
+        'n_candidates': len(candidates),
+        'targets': {'min_sensitivity': min_sensitivity, 'min_specificity': min_specificity} if threshold_tuning else None,
+        'threshold_method': threshold_method if threshold_tuning else 'fixed',
+        'inner_metrics_are_for_selection_only': True,
+        'score_scale_note': 'Each fold fits its own SVM; refitting may change score scale.',
+    }
     if output is not None:
         candidates.to_csv(Path(output) / 'joint_candidates.csv', index=False)
         sweeps[chosen_id - 1].to_csv(Path(output) / 'selected_candidate_threshold_sweep.csv', index=False)
@@ -900,10 +923,49 @@ def _outer_metrics(y, prediction, scores=None):
     counts = result['confusion_counts']
     n_positive = counts['TP'] + counts['FN']
     both_classes = len(np.unique(y)) == 2
-    result.update(fog_f1=float(f1_score(y, prediction, zero_division=0)) if n_positive else None, balanced_accuracy=(result['sensitivity'] + result['specificity']) / 2 if both_classes else None, roc_auc=float(roc_auc_score(y, scores)) if both_classes and scores is not None else None, average_precision=float(average_precision_score(y, scores)) if both_classes and scores is not None else None, confusion_matrix=confusion_matrix(y, prediction, labels=[0, 1]).tolist(), confusion_matrix_order=['Non-FOG', 'FOG'])
+    result.update(
+        fog_f1=float(f1_score(y, prediction, zero_division=0)) if n_positive else None,
+        balanced_accuracy=(result['sensitivity'] + result['specificity']) / 2 if both_classes else None,
+        geometric_mean=float(np.sqrt(result['sensitivity'] * result['specificity'])) if both_classes and result['sensitivity'] is not None and result['specificity'] is not None else None,
+        roc_auc=float(roc_auc_score(y, scores)) if both_classes and scores is not None else None,
+        average_precision=float(average_precision_score(y, scores)) if both_classes and scores is not None else None,
+        confusion_matrix=confusion_matrix(y, prediction, labels=[0, 1]).tolist(),
+        confusion_matrix_order=['Non-FOG', 'FOG'],
+    )
     return result
 
-def train_loso(paths, output, *, kernel='rbf', C=1.0, gamma='scale', seed=42, tune=False, threshold_tuning=False, cv_folds=3, n_jobs=1, cache_size=512.0, decision_threshold=0.0, min_sensitivity=0.85, min_specificity=0.85, threshold_method='grid', threshold_min=-1.5, threshold_max=0.5, threshold_step=0.02, C_grid=None, gamma_grid=None, save_models=True, save_all_sweeps=False, median_filter=1, cfs=False, cfs_max_features=30 ):
+
+def train_loso(
+    paths,
+    output,
+    *,
+    kernel='rbf',
+    C=1.0,
+    gamma='scale',
+    seed=42,
+    tune=False,
+    threshold_tuning=False,
+    cv_folds=3,
+    n_jobs=1,
+    cache_size=512.0,
+    decision_threshold=0.0,
+    min_sensitivity=0.85,
+    min_specificity=0.85,
+    threshold_method='grid',
+    threshold_min=-1.5,
+    threshold_max=0.5,
+    threshold_step=0.02,
+    C_grid=None,
+    gamma_grid=None,
+    save_models=True,
+    save_all_sweeps=False,
+    median_filter=1,
+    cfs=False,
+    cfs_max_features=30,
+    selection_metric='gm',
+    class_weight='balanced',
+    fog_weight_ratio=None,
+):
     _loso_options(kernel, C, gamma, cache_size, decision_threshold, min_sensitivity, min_specificity, n_jobs)
     if threshold_tuning and decision_threshold != 0.0:
         raise ValueError('Không đặt threshold khác 0 cùng chế độ tự chọn ngưỡng.')
@@ -914,8 +976,11 @@ def train_loso(paths, output, *, kernel='rbf', C=1.0, gamma='scale', seed=42, tu
     output = Path(output)
     if output.exists() and any(output.iterdir()):
         raise ValueError('LOSO cần output mới/rỗng để tránh trộn các lượt đánh giá.')
+
     data, names, config = load_datasets(paths)
     cfs, cfs_max_features = _resolve_cfs_from_config(config, cfs, cfs_max_features)
+    resolved_cw = _resolve_svm_class_weight(class_weight, fog_weight_ratio)
+
     X, y, groups = (data['X'], data['y'], data['subject_id'])
     if len(np.unique(groups)) < 2 or len(np.unique(y)) != 2:
         raise ValueError('LOSO cần >=2 bệnh nhân và cả hai lớp trong toàn dataset.')
@@ -926,20 +991,59 @@ def train_loso(paths, output, *, kernel='rbf', C=1.0, gamma='scale', seed=42, tu
             raise ValueError(f'LOSO test {groups[test_idx][0]}: nhóm train thiếu lớp.')
         if needs_inner:
             _group_folds(X[train_idx], y[train_idx], groups[train_idx], cv_folds, seed)
+
     output.mkdir(parents=True, exist_ok=True)
     _write_json(output / 'dataset_info.json', config)
     _write_json(output / 'feature_names.json', names)
-    settings = {'model_type': 'svm', 'model_name': 'SVM', 'score_units': 'SVM decision score', 'evaluation': 'loso', 'trainer_version': TRAINER_VERSION, 'outer_folds': len(outer_folds), 'inner_cv': 'SGKF' if needs_inner else None, 'inner_cv_folds': cv_folds if needs_inner else None, 'cv_levels': 2 if needs_inner else 1, 'tune': bool(tune), 'threshold_tuning': bool(threshold_tuning), 'seed': seed, 'threshold_method': threshold_method, 'kernel': kernel, 'fixed_C': float(C), 'fixed_gamma': gamma, 'fixed_decision_threshold': float(decision_threshold), 'class_weight': 'balanced', 'cache_size': cache_size, 'n_jobs': n_jobs, 'versions': {'sklearn': sklearn.__version__, 'numpy': np.__version__, 'pandas': pd.__version__}, 'fallback_policy': 'best inner balanced accuracy when both targets cannot be met', 'n_features': len(names), 'input_files': config['input_files'], 'C_grid': C_grid if C_grid is not None else [0.1, 1.0, 10.0, 100.0], 'gamma_grid': gamma_grid if gamma_grid is not None else ['scale', 0.01, 0.1], 'min_sensitivity': min_sensitivity, 'min_specificity': min_specificity, 'threshold_grid': {'min': threshold_min, 'max': threshold_max, 'step': threshold_step, 'median_filter': int(median_filter), 'cfs': bool(cfs), 'cfs_max_features': int(cfs_max_features) if cfs else None }}
+
+    settings = {
+        'model_type': 'svm',
+        'model_name': 'Weighted SVM' if resolved_cw is not None else 'Standard SVM',
+        'score_units': 'SVM decision score',
+        'evaluation': 'loso',
+        'trainer_version': TRAINER_VERSION,
+        'outer_folds': len(outer_folds),
+        'inner_cv': 'SGKF' if needs_inner else None,
+        'inner_cv_folds': cv_folds if needs_inner else None,
+        'cv_levels': 2 if needs_inner else 1,
+        'tune': bool(tune),
+        'threshold_tuning': bool(threshold_tuning),
+        'selection_metric': selection_metric,
+        'seed': seed,
+        'threshold_method': threshold_method,
+        'kernel': kernel,
+        'fixed_C': float(C),
+        'fixed_gamma': gamma,
+        'fixed_decision_threshold': float(decision_threshold),
+        'class_weight': class_weight if fog_weight_ratio is None else f'custom_ratio_1:{fog_weight_ratio:g}',
+        'fog_weight_ratio': float(fog_weight_ratio) if fog_weight_ratio is not None else None,
+        'cfs': bool(cfs),
+        'cfs_max_features': int(cfs_max_features) if cfs else None,
+        'median_filter_window': int(median_filter),
+        'cache_size': cache_size,
+        'n_jobs': n_jobs,
+        'versions': {'sklearn': sklearn.__version__, 'numpy': np.__version__, 'pandas': pd.__version__},
+        'fallback_policy': f'best inner {selection_metric} when both targets cannot be met',
+        'n_features': len(names),
+        'input_files': config['input_files'],
+        'C_grid': C_grid if C_grid is not None else [0.1, 1.0, 10.0, 100.0],
+        'gamma_grid': gamma_grid if gamma_grid is not None else ['scale', 0.01, 0.1],
+        'min_sensitivity': min_sensitivity,
+        'min_specificity': min_specificity,
+        'threshold_grid': {'min': threshold_min, 'max': threshold_max, 'step': threshold_step},
+    }
     _write_json(output / 'run_settings.json', settings)
     _write_json(output / 'run_status.json', {'status': 'running', 'completed_subjects': []})
+
     steps = [
         ('imputer', SimpleImputer(strategy='median', add_indicator=True, keep_empty_features=True)),
         ('scaler', StandardScaler()),
     ]
     if cfs:
         steps.append(('cfs', CFSSelector(max_features=cfs_max_features)))
-    steps.append(('svm', SVC(kernel=kernel, C=C, gamma=gamma, class_weight='balanced', probability=False, cache_size=cache_size)))
+    steps.append(('svm', SVC(kernel=kernel, C=C, gamma=gamma, class_weight=resolved_cw, probability=False, cache_size=cache_size)))
     pipeline = Pipeline(steps)
+
     subject_rows, predictions_all, fold_records, seen = ([], [], [], np.zeros(len(y), dtype=int))
     for fold, (train_idx, test_idx) in enumerate(outer_folds, 1):
         subject = str(groups[test_idx][0])
@@ -948,8 +1052,33 @@ def train_loso(paths, output, *, kernel='rbf', C=1.0, gamma='scale', seed=42, tu
         directory.mkdir()
         manifest = _manifest(data, train_idx, test_idx)
         manifest.to_csv(directory / 'split_manifest.csv', index=False)
+
         if needs_inner:
-            selected, inner_scores, inner_ids = select_joint_parameters(pipeline, X[train_idx], y[train_idx], groups[train_idx], tune=tune, threshold_tuning=threshold_tuning, cv_folds=cv_folds, seed=seed, kernel=kernel, decision_threshold=decision_threshold, min_sensitivity=min_sensitivity, min_specificity=min_specificity, threshold_method=threshold_method, threshold_min=threshold_min, threshold_max=threshold_max, threshold_step=threshold_step, C_grid=C_grid, gamma_grid=gamma_grid, n_jobs=n_jobs, save_all_sweeps=save_all_sweeps, output=directory)
+            # Bước 1 -> Bước 5: Chọn C, gamma theo selection_metric (mặc định: 'gm' trên inner SGKF)
+            selected, inner_scores, inner_ids = select_joint_parameters(
+                pipeline,
+                X[train_idx],
+                y[train_idx],
+                groups[train_idx],
+                tune=tune,
+                threshold_tuning=threshold_tuning,
+                cv_folds=cv_folds,
+                seed=seed,
+                kernel=kernel,
+                decision_threshold=decision_threshold,
+                min_sensitivity=min_sensitivity,
+                min_specificity=min_specificity,
+                threshold_method=threshold_method,
+                threshold_min=threshold_min,
+                threshold_max=threshold_max,
+                threshold_step=threshold_step,
+                C_grid=C_grid,
+                gamma_grid=gamma_grid,
+                n_jobs=n_jobs,
+                save_all_sweeps=save_all_sweeps,
+                output=directory,
+                selection_metric=selection_metric,
+            )
             inner = manifest.iloc[train_idx].copy()
             inner['Split'] = 'inner_validation_oof'
             inner['Inner_Fold'] = inner_ids
@@ -959,18 +1088,52 @@ def train_loso(paths, output, *, kernel='rbf', C=1.0, gamma='scale', seed=42, tu
             inner.to_csv(directory / 'inner_validation_scores.csv', index=False)
             _patient_metrics(y[train_idx], inner_scores, groups[train_idx], selected['decision_threshold']).to_csv(directory / 'inner_patient_metrics.csv', index=False)
         else:
-            selected = {'C': float(C), 'gamma': gamma, 'decision_threshold': float(decision_threshold), 'target_met': None, 'threshold_role': 'fixed_baseline', 'selection_rule': 'predeclared fixed parameters'}
+            selected = {
+                'C': float(C),
+                'gamma': gamma,
+                'decision_threshold': float(decision_threshold),
+                'selection_metric': selection_metric,
+                'target_met': None,
+                'threshold_role': 'fixed_baseline',
+                'selection_rule': 'predeclared fixed parameters',
+            }
             _write_json(directory / 'selected_parameters.json', selected)
+
+        # Bước 6: Train lại bằng toàn bộ outer training subjects với cặp (C, gamma) đã chọn, rồi đánh giá trên outer test
         model = clone(pipeline).set_params(svm__C=selected['C'], svm__gamma=selected['gamma'])
         model.fit(X[train_idx], y[train_idx])
-
         scores = model.decision_function(X[test_idx])
         threshold = selected['decision_threshold']
         raw_predicted = (scores > threshold).astype(np.int8)
-        predicted = apply_median_postprocessing(manifest.iloc[test_idx], raw_predicted, median_filter)       
+        predicted = apply_median_postprocessing(manifest.iloc[test_idx], raw_predicted, median_filter)
+
+        cfs_selected_features = None
+        if cfs and 'cfs' in model.named_steps:
+            cfs_step = model.named_steps['cfs']
+            cfs_selected_features = [names[idx] for idx in cfs_step.selected_indices_ if idx < len(names)]
+
         metrics = _outer_metrics(y[test_idx], predicted, scores)
-        metrics.update(status='completed', evaluation='LOSO outer test', trainer_version=TRAINER_VERSION, test_subject=subject, train_subjects=np.unique(groups[train_idx]).tolist(), test_subjects=[subject], train_windows=len(train_idx), test_windows=len(test_idx), n_features=len(names), decision_threshold=float(threshold), median_filter_window=int(median_filter), selected_parameters=selected, svm_parameters=model.named_steps['svm'].get_params(), support_vectors=model.named_steps['svm'].n_support_.tolist())
+        metrics.update(
+            status='completed',
+            evaluation='LOSO outer test',
+            trainer_version=TRAINER_VERSION,
+            test_subject=subject,
+            train_subjects=np.unique(groups[train_idx]).tolist(),
+            test_subjects=[subject],
+            train_windows=len(train_idx),
+            test_windows=len(test_idx),
+            n_features=len(names),
+            cfs_enabled=bool(cfs),
+            cfs_selected_count=len(cfs_selected_features) if cfs_selected_features is not None else None,
+            cfs_selected_features=cfs_selected_features,
+            decision_threshold=float(threshold),
+            median_filter_window=int(median_filter),
+            selected_parameters=selected,
+            svm_parameters=model.named_steps['svm'].get_params(),
+            support_vectors=model.named_steps['svm'].n_support_.tolist(),
+        )
         _write_json(directory / 'metrics.json', metrics)
+
         pred_table = manifest.iloc[test_idx].copy()
         pred_table['Dataset_Row'] = test_idx
         pred_table['Outer_Fold'] = fold
@@ -983,25 +1146,81 @@ def train_loso(paths, output, *, kernel='rbf', C=1.0, gamma='scale', seed=42, tu
         pred_table['Gamma'] = selected['gamma']
         pred_table['Threshold_Role'] = selected['threshold_role']
         pred_table.to_csv(directory / 'test_predictions.csv', index=False)
+
         predictions_all.append(pred_table)
         seen[test_idx] += 1
         counts = metrics['confusion_counts']
-        subject_rows.append({'Outer_Fold': fold, 'Subject_ID': subject, 'N_Windows': len(test_idx), 'N_FOG': int(np.sum(y[test_idx] == 1)), **{k: metrics[k] for k in ['sensitivity', 'specificity', 'ppv', 'npv', 'accuracy', 'fog_f1', 'balanced_accuracy', 'youden_index', 'roc_auc', 'average_precision']}, **counts, 'C': selected['C'], 'Gamma': selected['gamma'], 'Decision_Threshold': threshold, 'Target_Met_Inner': selected['target_met'], 'Threshold_Role': selected['threshold_role']})
-        fold_records.append({'Outer_Fold': fold, 'Test_Subject': subject, 'Train_Subjects': ','.join(np.unique(groups[train_idx])), 'Train_Windows': len(train_idx), 'Test_Windows': len(test_idx)})
+        metric_cols = ['sensitivity', 'specificity', 'geometric_mean', 'ppv', 'npv', 'accuracy', 'fog_f1', 'balanced_accuracy', 'youden_index', 'roc_auc', 'average_precision']
+        subject_rows.append({
+            'Outer_Fold': fold,
+            'Subject_ID': subject,
+            'N_Windows': len(test_idx),
+            'N_FOG': int(np.sum(y[test_idx] == 1)),
+            **{k: metrics[k] for k in metric_cols},
+            **counts,
+            'C': selected['C'],
+            'Gamma': selected['gamma'],
+            'Decision_Threshold': threshold,
+            'Target_Met_Inner': selected['target_met'],
+            'Threshold_Role': selected['threshold_role'],
+        })
+        fold_records.append({
+            'Outer_Fold': fold,
+            'Test_Subject': subject,
+            'Train_Subjects': ','.join(np.unique(groups[train_idx])),
+            'Train_Windows': len(train_idx),
+            'Test_Windows': len(test_idx),
+        })
         if save_models:
-            bundle = {'pipeline': model, 'feature_names': names, 'label_mapping': {0: 'Non-FOG', 1: 'FOG'}, 'processing_config': config, 'model_type': 'SVC', 'metrics': metrics, 'train_subjects': metrics['train_subjects'], 'test_subjects': [subject], 'decision_threshold': float(threshold), 'trainer_version': TRAINER_VERSION, 'purpose': 'LOSO evaluation fold; not a model fitted on the full dataset'}
+            bundle = {
+                'pipeline': model,
+                'feature_names': names,
+                'label_mapping': {0: 'Non-FOG', 1: 'FOG'},
+                'processing_config': config,
+                'model_type': 'SVC',
+                'metrics': metrics,
+                'train_subjects': metrics['train_subjects'],
+                'test_subjects': [subject],
+                'decision_threshold': float(threshold),
+                'trainer_version': TRAINER_VERSION,
+                'purpose': 'LOSO evaluation fold; not a model fitted on the full dataset',
+            }
             joblib.dump(bundle, directory / 'fog_svm.joblib')
         _write_json(output / 'run_status.json', {'status': 'running', 'completed_subjects': [row['Subject_ID'] for row in subject_rows]})
+
     if not np.all(seen == 1):
         raise ValueError('LOSO cần mỗi cửa sổ được test đúng một lần.')
     joined = pd.concat(predictions_all, ignore_index=True).sort_values('Dataset_Row')
     subjects = pd.DataFrame(subject_rows)
     pooled = _outer_metrics(joined.Binary_Label.to_numpy(), joined.Prediction.to_numpy())
     macro = {}
-    for key in ['sensitivity', 'specificity', 'ppv', 'npv', 'accuracy', 'fog_f1', 'balanced_accuracy', 'youden_index', 'roc_auc', 'average_precision']:
+    for key in ['sensitivity', 'specificity', 'geometric_mean', 'ppv', 'npv', 'accuracy', 'fog_f1', 'balanced_accuracy', 'youden_index', 'roc_auc', 'average_precision']:
         values = subjects[key].dropna().to_numpy(float)
-        macro[key] = {'mean': float(values.mean()) if len(values) else None, 'std_sample': float(values.std(ddof=1)) if len(values) > 1 else None, 'n_valid_subjects': len(values)}
-    summary = {'status': 'completed', 'evaluation': 'LOSO', 'trainer_version': TRAINER_VERSION, 'settings': settings, 'n_subjects': len(subjects), 'n_test_windows': len(joined), 'pooled_metrics': pooled, 'subject_macro_metrics': macro, 'target_met_inner_folds': int(sum((row['Target_Met_Inner'] is True for row in subject_rows))) if threshold_tuning else None, 'fallback_inner_folds': int(sum((row['Target_Met_Inner'] is False for row in subject_rows))) if threshold_tuning else None, 'notes': ['All subjects and windows are included in outer-test aggregation.', 'Sensitivity/F1 for subjects with no actual FOG are null; undefined denominators are null.', 'Pooled ROC-AUC/AP are intentionally null: raw score scales differ across outer models.', 'Inner selection metrics are not independent performance estimates.', 'LOSO folds are correlated; subject std is descriptive, not a confidence interval.', 'No full-dataset deployment model is fitted by this evaluation.']}
+        macro[key] = {
+            'mean': float(values.mean()) if len(values) else None,
+            'std_sample': float(values.std(ddof=1)) if len(values) > 1 else None,
+            'n_valid_subjects': len(values),
+        }
+    summary = {
+        'status': 'completed',
+        'evaluation': 'LOSO',
+        'trainer_version': TRAINER_VERSION,
+        'settings': settings,
+        'n_subjects': len(subjects),
+        'n_test_windows': len(joined),
+        'pooled_metrics': pooled,
+        'subject_macro_metrics': macro,
+        'target_met_inner_folds': int(sum((row['Target_Met_Inner'] is True for row in subject_rows))) if threshold_tuning else None,
+        'fallback_inner_folds': int(sum((row['Target_Met_Inner'] is False for row in subject_rows))) if threshold_tuning else None,
+        'notes': [
+            'All subjects and windows are included in outer-test aggregation.',
+            'Sensitivity/F1/GM for subjects with no actual FOG are null; undefined denominators are null.',
+            'Pooled ROC-AUC/AP are intentionally null: raw score scales differ across outer models.',
+            'Inner selection metrics are not independent performance estimates.',
+            'LOSO folds are correlated; subject std is descriptive, not a confidence interval.',
+            'No full-dataset deployment model is fitted by this evaluation.',
+        ],
+    }
     joined.to_csv(output / 'loso_predictions.csv', index=False)
     subjects.to_csv(output / 'loso_subject_metrics.csv', index=False)
     pd.DataFrame(fold_records).to_csv(output / 'loso_fold_manifest.csv', index=False)
@@ -1009,6 +1228,7 @@ def train_loso(paths, output, *, kernel='rbf', C=1.0, gamma='scale', seed=42, tu
     _write_json(output / 'run_status.json', {'status': 'completed', 'completed_subjects': subjects.Subject_ID.tolist(), 'n_outer_folds': len(subjects)})
     print(f'LOSO completed: {len(subjects)} subjects, {len(joined):,} outer-test windows.', flush=True)
     return summary
+
 
 def _gamma(value):
     if value in ('scale', 'auto'):
@@ -1020,6 +1240,7 @@ def _gamma(value):
         return number
     except ValueError as exc:
         raise argparse.ArgumentTypeError('gamma cần scale, auto hoặc số >0.') from exc
+
 
 def svm_main(argv=None):
     parser = argparse.ArgumentParser(description='SVM RBF/linear: holdout theo bệnh nhân hoặc LOSO. Chọn RF: --model rf. Tính SHAP sau train: --shap.', formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1050,8 +1271,11 @@ def svm_main(argv=None):
     parser.add_argument('--no-save-models', action='store_true', help='LOSO only: omit per-fold joblib models')
     parser.add_argument('--save-all-sweeps', action='store_true', help='LOSO: save threshold sweeps for every parameter candidate (can be large)')
     parser.add_argument('--median-filter', type=_positive_odd_int, default=1, help='Cửa sổ lọc trung vị hậu xử lý theo Mazilu 2012 (1=tắt, 3, 5, 15, 31)')
-    parser.add_argument('--cfs', action='store_true', help='Bật chọn lọc đặc trưng CFS (Mazilu 2012) bên trong từng fold.')
-    parser.add_argument('--cfs-max-features', type=int, default=30, help='Số đặc trưng tối đa tìm kiếm trong CFS (mặc định: 30).')
+    parser.add_argument('--cfs', action='store_true', help='Bật chọn lọc đặc trưng CFS (Mazilu 2012) bên trong từng fold')
+    parser.add_argument('--cfs-max-features', type=int, default=30, help='Số đặc trưng tối đa được CFS chọn (mặc định: 30)')
+    parser.add_argument('--selection-metric', choices=['gm', 'f1', 'balanced_accuracy'], default='gm', help='Tiêu chí chọn C/gamma trong inner SGKF: gm (Geometric Mean - Ahlrichs 2016), f1, hoặc balanced_accuracy')
+    parser.add_argument('--class-weight', choices=['balanced', 'none'], default='balanced', help='Weighted SVM (balanced theo Ahlrichs 2016) hoặc SVM thường (none) để đối chứng')
+    parser.add_argument('--fog-weight-ratio', type=float, default=None, help='Tỷ lệ phạt cố định C+/C- cho lớp FOG (tùy chọn thay cho balanced tự động)')
     args = parser.parse_args(argv)
     try:
         if args.evaluation == 'loso':
@@ -1064,12 +1288,51 @@ def svm_main(argv=None):
         elif args.C_grid is not None or args.gamma_grid is not None or args.no_save_models or args.save_all_sweeps:
             raise ValueError('Grid tùy chỉnh và tùy chọn lưu model/sweep mới chỉ dùng trong LOSO.')
         paths = discover_inputs(args.input)
-        common = dict(kernel=args.kernel, C=args.C, gamma=args.gamma, seed=args.seed, tune=args.tune, threshold_tuning=args.threshold_tuning, cv_folds=args.cv_folds, n_jobs=args.n_jobs, cache_size=args.cache_size, decision_threshold=args.decision_threshold, min_sensitivity=args.min_sensitivity, min_specificity=args.min_specificity, threshold_method=args.threshold_method, threshold_min=args.threshold_min, threshold_max=args.threshold_max, threshold_step=args.threshold_step)
-        median_filter = args.median_filter
+        common = dict(
+            kernel=args.kernel,
+            C=args.C,
+            gamma=args.gamma,
+            seed=args.seed,
+            tune=args.tune,
+            threshold_tuning=args.threshold_tuning,
+            cv_folds=args.cv_folds,
+            n_jobs=args.n_jobs,
+            cache_size=args.cache_size,
+            decision_threshold=args.decision_threshold,
+            min_sensitivity=args.min_sensitivity,
+            min_specificity=args.min_specificity,
+            threshold_method=args.threshold_method,
+            threshold_min=args.threshold_min,
+            threshold_max=args.threshold_max,
+            threshold_step=args.threshold_step,
+            median_filter=args.median_filter,
+            cfs=args.cfs,
+            cfs_max_features=args.cfs_max_features,
+        )
         if args.evaluation == 'loso':
-            metrics = train_loso(paths, args.output, **common, C_grid=args.C_grid, gamma_grid=args.gamma_grid, save_models=not args.no_save_models, save_all_sweeps=args.save_all_sweeps)
+            metrics = train_loso(
+                paths,
+                args.output,
+                **common,
+                C_grid=args.C_grid,
+                gamma_grid=args.gamma_grid,
+                save_models=not args.no_save_models,
+                save_all_sweeps=args.save_all_sweeps,
+                selection_metric=args.selection_metric,
+                class_weight=args.class_weight,
+                fog_weight_ratio=args.fog_weight_ratio,
+            )
         else:
-            metrics = train(paths, args.output, test_size=0.25 if args.test_size is None else args.test_size, test_subjects=args.test_subjects, inner_cv_folds=3 if args.inner_cv_folds is None else args.inner_cv_folds, **common)
+            metrics = train(
+                paths,
+                args.output,
+                test_size=0.25 if args.test_size is None else args.test_size,
+                test_subjects=args.test_subjects,
+                inner_cv_folds=3 if args.inner_cv_folds is None else args.inner_cv_folds,
+                class_weight=args.class_weight,
+                fog_weight_ratio=args.fog_weight_ratio,
+                **common,
+            )
     except (ValueError, KeyError, OSError) as exc:
         parser.exit(2, f'ERROR: {exc}\n')
     if args.evaluation == 'loso':
@@ -1078,8 +1341,7 @@ def svm_main(argv=None):
     if metrics.get('status') == 'target_not_met':
         print(json.dumps(metrics, ensure_ascii=False, indent=2))
         parser.exit(2, 'TARGET_NOT_MET: xem validation_threshold_sweep.csv; test chưa được đánh giá.\n')
-    print(json.dumps({key: metrics[key] for key in ['sensitivity', 'specificity', 'ppv', 'npv', 'accuracy', 'youden_index', 'balanced_accuracy', 'fog_f1', 'roc_auc', 'average_precision', 'train_subjects', 'test_subjects']}, indent=2))
-
+    print(json.dumps({key: metrics[key] for key in ['sensitivity', 'specificity', 'geometric_mean', 'ppv', 'npv', 'accuracy', 'youden_index', 'balanced_accuracy', 'fog_f1', 'roc_auc', 'average_precision', 'train_subjects', 'test_subjects']}, indent=2))
 def training_dataset(paths):
     data, names, info = load_datasets([Path(p) for p in paths])
     meta = pd.DataFrame({'Subject_ID': data['subject_id'], 'Recording_ID': data['recording_id'], 'Segment_ID': data['segment_id'], 'Window_ID': data['window_id'], 'Start_Time': data['window_start'], 'End_Time': data['window_end'], 'Binary_Label': data['y']})
@@ -1107,8 +1369,25 @@ def rf_diagnostic_metrics(y, pred, scores=None):
 
     def div(a, b):
         return a / b if b else None
+
     sens, spec = (div(tp, tp + fn), div(tn, tn + fp))
-    result = dict(sensitivity=sens, specificity=spec, ppv=div(tp, tp + fp), npv=div(tn, tn + fn), accuracy=div(tp + tn, len(y)), fog_f1=div(2 * tp, 2 * tp + fp + fn), balanced_accuracy=None if sens is None or spec is None else (sens + spec) / 2, youden_index=None if sens is None or spec is None else sens + spec - 1, confusion_counts=dict(TN=tn, FP=fp, FN=fn, TP=tp), confusion_matrix=[[tn, fp], [fn, tp]], positive_class='FOG (1)', confusion_matrix_order=['Non-FOG', 'FOG'], evaluation_unit='window')
+    gm = None if sens is None or spec is None else float(np.sqrt(sens * spec))
+    result = dict(
+        sensitivity=sens,
+        specificity=spec,
+        geometric_mean=gm,
+        ppv=div(tp, tp + fp),
+        npv=div(tn, tn + fn),
+        accuracy=div(tp + tn, len(y)),
+        fog_f1=div(2 * tp, 2 * tp + fp + fn),
+        balanced_accuracy=None if sens is None or spec is None else (sens + spec) / 2,
+        youden_index=None if sens is None or spec is None else sens + spec - 1,
+        confusion_counts=dict(TN=tn, FP=fp, FN=fn, TP=tp),
+        confusion_matrix=[[tn, fp], [fn, tp]],
+        positive_class='FOG (1)',
+        confusion_matrix_order=['Non-FOG', 'FOG'],
+        evaluation_unit='window',
+    )
     if tp + fn == 0:
         result['fog_f1'] = None
     result['roc_auc'] = float(roc_auc_score(y, scores)) if scores is not None and len(np.unique(y)) == 2 else None
@@ -1251,7 +1530,7 @@ def rf_train(args):
         pd.DataFrame(subject_metrics).to_csv(output / 'loso_subject_metrics.csv', index=False)
         pd.DataFrame(fold_manifest).to_csv(output / 'loso_fold_manifest.csv', index=False)
         macro = {}
-        for key in ['sensitivity', 'specificity', 'ppv', 'npv', 'accuracy', 'fog_f1', 'balanced_accuracy', 'youden_index', 'roc_auc', 'average_precision']:
+        for key in ['sensitivity', 'specificity', 'geometric_mean', 'ppv', 'npv', 'accuracy', 'fog_f1', 'balanced_accuracy', 'youden_index', 'roc_auc', 'average_precision']:
             values = [row[key] for row in subject_metrics if row.get(key) is not None]
             macro[key] = dict(mean=float(np.mean(values)) if values else None, std_sample=float(np.std(values, ddof=1)) if len(values) > 1 else None, n_valid_subjects=len(values))
         pooled = rf_diagnostic_metrics(combined.Binary_Label.to_numpy(), combined.Prediction.to_numpy())
