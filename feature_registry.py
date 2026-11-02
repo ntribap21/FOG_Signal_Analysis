@@ -250,7 +250,7 @@ def axis_extra(x,fs,config):
         fstd_low = _freq_std_band(f_fft, p_fft, 0.1, 0.68)
         fstd_high = _freq_std_band(f_fft, p_fft, 8.0, min(20.0, fs / 2.0))
         ar_coeffs = _ar_yule_walker(xc, order=12) if not flat else [np.nan] * 12
-        integ_fn = getattr(np, 'trapezoid', np.trapz)
+        integ_fn = getattr(np, 'trapezoid', np.trapezoid)
         integral_val = float(integ_fn(np.abs(xc), dx=1.0 / fs))
         out.update(
             Mean_Locomotor=m_loco, Std_Locomotor=s_loco, Entropy_Locomotor=e_loco,
@@ -368,7 +368,7 @@ def window_psd(x,fs):
 def band_power(f,p,lo,hi):
     mask=(f>=lo)&(f<=hi)
     if mask.sum()<2: return 0.
-    return float(np.trapezoid(p[mask],f[mask]) if hasattr(np,'trapezoid') else np.trapz(p[mask],f[mask]))
+    return float(np.trapezoid(p[mask],f[mask]) if hasattr(np,'trapezoid') else np.trapezoid(p[mask],f[mask]))
 
 
 def temporal_extra(history,current,start,config,fs):

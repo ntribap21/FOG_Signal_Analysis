@@ -321,7 +321,7 @@ class ProcessingEngine:
             xc,fs=fs, window="hann",
             nperseg=nperseg, noverlap=noverlap, nfft=nfft,
             detrend=False, scaling="density")
-        integ=lambda y,z: float(np.trapezoid(y,z) if hasattr(np,"trapezoid") else np.trapz(y,z)) if len(y)>1 else 0.0
+        integ=lambda y,z: float(np.trapezoid(y,z) if hasattr(np,"trapezoid") else np.trapezoid(y,z)) if len(y)>1 else 0.0
         total=integ(pp,pf); 
         lm=(pf >= 0.5) & (pf <= 3.0); 
         fm=(pf >= 3.0) & (pf <= 8.0); 
