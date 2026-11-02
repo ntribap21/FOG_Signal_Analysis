@@ -2381,130 +2381,221 @@ class FOGSignalAnalyzer(QMainWindow):
         self._update_feature_summary()
 
     def _update_feature_summary(self):
-        if not hasattr(self,'feature_summary'): return
+        if not hasattr(self, 'feature_summary'):
+            return
         try:
-            c=self.capture_config()
-            self.feature_summary.setText(f"{len(feature_names(c))} features/window · {', '.join(c['sensors'])} · {', '.join(c['axes'])}")
+            c = self.capture_config()
+            fo = feature_options(c)
+            cfs_text = f" · CFS ON (≤ {fo['cfs_max_features']} selected in train)" if fo.get('cfs') else ""
+            self.feature_summary.setText(
+                f"{len(feature_names(c))} features/window{cfs_text} · {', '.join(c['sensors'])} · {', '.join(c['axes'])}"
+            )
         except Exception as exc:
             self.feature_summary.setText(str(exc))
 
     def _copy_features_to_batch(self):
-        self._restore_feature_options('batch',{'feature_options':self._get_feature_options('analysis')})
+        self._restore_feature_options('batch', {'feature_options': self._get_feature_options('analysis')})
         self._batch_changed()
 
     def _feature_panel(self, scope):
-        box=QGroupBox('FEATURES');layout=QVBoxLayout(box)
-        base=QGroupBox('BASIC FEATURES — choose individually');grid=QGridLayout(base);grid.setObjectName('feature_base_grid');basechecks={}
-        for i,name in enumerate(BASE):
-            w=QCheckBox(name.replace('_',' '));w.setChecked(True);basechecks[name]=w;grid.addWidget(w,i//4,i%4)
-            w.toggled.connect(lambda _=False,sc=scope:self._features_changed(sc))
-        buttons=QHBoxLayout()
-        for label,value in [('ALL BASIC',True),('NO BASIC',False)]:
-            b=QPushButton(label);b.clicked.connect(lambda _=False,sc=scope,v=value:self._set_feature_checks(sc,'base',v));buttons.addWidget(b)
-        grid.addLayout(buttons,(len(BASE)+3)//4,0,1,4);layout.addWidget(base)
-        extras=QGroupBox('ADDITIONAL FEATURE GROUPS');g=QGridLayout(extras);checks={}
-        for i,(key,label) in enumerate(GROUPS.items()):
-            w=QCheckBox(label);checks[key]=w;g.addWidget(w,i//2,i%2)
-            if key=='cwt':
-                w.setToolTip('db4; 0.5–3 / 3–8 Hz; 0.5 Hz step. Signed: paper ratio formula; may be unbounded or NaN. Absolute: a separate extension. Paper-like preprocessing: 64 Hz, low-pass 10 Hz/order 4, 2 s/50%. Enabling CWT does not change preprocessing.')
-            if scope=='analysis' and key in ('crosscorr','ater'):
-                w.setEnabled(False);w.setToolTip('Use Batch with all three axes and the required sensors.')
-            w.toggled.connect(lambda _=False,sc=scope:self._features_changed(sc))
+        box = QGroupBox('FEATURES')
+        layout = QVBoxLayout(box)
+        base = QGroupBox('BASIC FEATURES — choose individually')
+        grid = QGridLayout(base)
+        grid.setObjectName('feature_base_grid')
+        basechecks = {}
+        for i, name in enumerate(BASE):
+            w = QCheckBox(name.replace('_', ' '))
+            w.setChecked(True)
+            basechecks[name] = w
+            grid.addWidget(w, i // 4, i % 4)
+            w.toggled.connect(lambda _=False, sc=scope: self._features_changed(sc))
+        buttons = QHBoxLayout()
+        for label, value in [('ALL BASIC', True), ('NO BASIC', False)]:
+            b = QPushButton(label)
+            b.clicked.connect(lambda _=False, sc=scope, v=value: self._set_feature_checks(sc, 'base', v))
+            buttons.addWidget(b)
+        grid.addLayout(buttons, (len(BASE) + 3) // 4, 0, 1, 4)
+        layout.addWidget(base)
+
+        extras = QGroupBox('ADDITIONAL FEATURE GROUPS')
+        g = QGridLayout(extras)
+        checks = {}
+        for i, (key, label) in enumerate(GROUPS.items()):
+            w = QCheckBox(label)
+            checks[key] = w
+            g.addWidget(w, i // 2, i % 2)
+            if key == 'cwt':
+                w.setToolTip(
+                    'Nhánh 1: db4; 0.5–3 / 3–8 Hz; bước 0.5 Hz; CHỈ tính trên trục Forward (Anterior-Posterior).'
+                )
+            elif key == 'rodriguez_axis':
+                w.setToolTip(
+                    '25 đặc trưng/trục: Mean/Std/Entropy Locomotor & Freeze, Freq_Std_Low (0.1–0.68Hz)/High (8–20Hz), AR_1..12, Integrals, Peak Amp/Freq.'
+                )
+            elif key == 'rodriguez_window':
+                w.setToolTip(
+                    '8 đặc trưng đa trục/cảm biến: Spectral_CoM (0.1–8Hz), Increments_AP, Diff_Inc_XY/XZ/YZ, PCA_1..3 (cần đủ 3 trục).'
+                )
+            if scope == 'analysis' and key in ('crosscorr', 'ater'):
+                w.setEnabled(False)
+                w.setToolTip('Use Batch with all three axes and the required sensors.')
+            w.toggled.connect(lambda _=False, sc=scope: self._features_changed(sc))
+        ebtns = QHBoxLayout()
+        for label, value in [('ALL ADDITIONAL', True), ('NO ADDITIONAL', False)]:
+            b = QPushButton(label)
+            b.clicked.connect(lambda _=False, sc=scope, v=value: self._set_feature_checks(sc, 'extra', v))
+            ebtns.addWidget(b)
+        g.addLayout(ebtns, (len(GROUPS) + 1) // 2, 0, 1, 2)
         layout.addWidget(extras)
-        params={};settings=QGroupBox('FEATURE PARAMETERS');g=QGridLayout(settings)
-        choices={'wavelet_name':['db4','db8'],'wavelet_mode':['symmetric','periodization'],'magnitude_mode':['dynamic','input']}
-        labels={'wavelet_name':'DWT wavelet','wavelet_level':'DWT level','wavelet_mode':'DWT extension',
-                'magnitude_mode':'Magnitude mode',
-                'harmonic_f0_hz':'Harmonic fundamental (Hz)',
-                'harmonic_count':'Number of harmonics','temporal_history':'Trend history (windows)'}
-        for i,(key,default) in enumerate(DEFAULTS.items()):
+
+        cfs_group = QGroupBox('CORRELATION-BASED FEATURE SUBSET SELECTION (CFS — Mazilu 2012)')
+        cfs_layout = QGridLayout(cfs_group)
+        cfs_check = QCheckBox('Enable CFS (lọc tập con đặc trưng tối ưu theo độ đo Merit bên trong từng fold train)')
+        cfs_check.setChecked(DEFAULTS.get('cfs', False))
+        cfs_spin = QSpinBox()
+        cfs_spin.setRange(1, 500)
+        cfs_spin.setValue(DEFAULTS.get('cfs_max_features', 30))
+        cfs_spin.setEnabled(cfs_check.isChecked())
+        cfs_check.toggled.connect(cfs_spin.setEnabled)
+        cfs_check.toggled.connect(lambda _=False, sc=scope: self._features_changed(sc))
+        cfs_spin.valueChanged.connect(lambda _=None, sc=scope: self._features_changed(sc))
+        cfs_layout.addWidget(cfs_check, 0, 0, 1, 2)
+        cfs_layout.addWidget(QLabel('Max selected features (k):'), 1, 0)
+        cfs_layout.addWidget(cfs_spin, 1, 1)
+        layout.addWidget(cfs_group)
+
+        params = {'cfs': cfs_check, 'cfs_max_features': cfs_spin}
+        settings = QGroupBox('FEATURE PARAMETERS')
+        g = QGridLayout(settings)
+        choices = {
+            'wavelet_name': ['db4', 'db8'],
+            'wavelet_mode': ['symmetric', 'periodization'],
+            'magnitude_mode': ['dynamic', 'input'],
+        }
+        labels = {
+            'wavelet_name': 'DWT wavelet',
+            'wavelet_level': 'DWT level',
+            'wavelet_mode': 'DWT extension',
+            'magnitude_mode': 'Magnitude mode',
+            'harmonic_f0_hz': 'Harmonic fundamental (Hz)',
+            'harmonic_count': 'Number of harmonics',
+            'temporal_history': 'Trend history (windows)',
+        }
+        param_keys = [k for k in DEFAULTS if k not in ('cfs', 'cfs_max_features')]
+        for i, key in enumerate(param_keys):
+            default = DEFAULTS[key]
             if key in choices:
-                w=QComboBox();w.addItems(choices[key]);w.setCurrentText(default)
-                w.currentTextChanged.connect(lambda _=None,sc=scope:self._features_changed(sc))
+                w = QComboBox()
+                w.addItems(choices[key])
+                w.setCurrentText(default)
+                w.currentTextChanged.connect(lambda _=None, sc=scope: self._features_changed(sc))
             elif type(default) is int:
-                w=QSpinBox();w.setRange(1 if key in ('entropy_m','wavelet_level') else 2,3 if key=='entropy_m' else 5 if key=='wavelet_level' else 20);w.setValue(default)
-                w.valueChanged.connect(lambda _=None,sc=scope:self._features_changed(sc))
+                w = QSpinBox()
+                w.setRange(1 if key in ('entropy_m', 'wavelet_level') else 2, 3 if key == 'entropy_m' else 5 if key == 'wavelet_level' else 20)
+                w.setValue(default)
+                w.valueChanged.connect(lambda _=None, sc=scope: self._features_changed(sc))
             else:
-                w=QDoubleSpinBox();w.setDecimals(10 if key=='ater_epsilon_g2' else 3)
-                w.setRange(1e-10 if key=='ater_epsilon_g2' else .001,1. if key in ('entropy_r_ratio','crosscorr_max_s') else 10.)
-                w.setValue(default);w.valueChanged.connect(lambda _=None,sc=scope:self._features_changed(sc))
-            params[key]=w;g.addWidget(QLabel(labels.get(key,key)),i//2,(i%2)*2);g.addWidget(w,i//2,(i%2)*2+1)
+                w = QDoubleSpinBox()
+                w.setDecimals(10 if key == 'ater_epsilon_g2' else 3)
+                w.setRange(1e-10 if key == 'ater_epsilon_g2' else 0.001, 1.0 if key in ('entropy_r_ratio', 'crosscorr_max_s') else 10.0)
+                w.setValue(default)
+                w.valueChanged.connect(lambda _=None, sc=scope: self._features_changed(sc))
+            params[key] = w
+            g.addWidget(QLabel(labels.get(key, key)), i // 2, (i % 2) * 2)
+            g.addWidget(w, i // 2, (i % 2) * 2 + 1)
         layout.addWidget(settings)
-        layout.addWidget(self._note('CWT: db4, 0.5–3 / 3–8 Hz, step 0.5 Hz. Signed index follows the paper ratio; Abs index uses absolute coefficients (extension). Short-window boundary effects apply. Enable CWT explicitly; preprocessing is unchanged. Suggested paper settings: 64 Hz, low-pass 10 Hz/order 4, 2 s/50%.'))
-        layout.addWidget(self._note('DWT bands depend on Fs. At 64 Hz: D3 ≈ 4–8 Hz, D4 ≈ 2–4 Hz. D3/D4 is not the 3–8 / 0.5–3 Hz Freeze Index. Harmonic ratio uses the configured fixed fundamental. Temporal features use past windows only and reset at segment boundaries. Undefined values remain NaN for train-fold imputation.'))
-        setattr(self,scope+'_base_checks',basechecks);setattr(self,scope+'_feature_checks',checks);setattr(self,scope+'_feature_params',params)
+        layout.addWidget(self._note(
+            'Nhánh 1 (CWT): Chỉ tính trên trục Forward (Anterior). Nhánh 2: Các nhóm đặc trưng còn lại (bao gồm Rodriguez 2017, Ahlrichs 2016, Mazilu 2012). '
+            'Khi tích chọn CFS, cờ cấu hình sẽ được lưu vào NPZ/JSON và tự động kích hoạt CFSSelector bên trong từng fold khi chạy train_fog.py.'
+        ))
+        setattr(self, scope + '_base_checks', basechecks)
+        setattr(self, scope + '_feature_checks', checks)
+        setattr(self, scope + '_feature_params', params)
         return box
 
-    def _set_feature_checks(self,scope,kind,value):
-        controls=getattr(self,scope+'_base_checks',{}) if kind=='base' else getattr(self,scope+'_feature_checks',{})
-        for w in controls.values():
-            if w.isEnabled(): w.blockSignals(True);w.setChecked(value);w.blockSignals(False)
-        self._features_changed(scope)
-
     def _get_feature_options(self, scope):
-        checks=getattr(self,scope+'_feature_checks',{});params=getattr(self,scope+'_feature_params',{})
-        base=getattr(self,scope+'_base_checks',{})
-        return {**{k:w.isChecked() for k,w in checks.items()},
-                **{k:w.currentText() if isinstance(w,QComboBox) else w.value() for k,w in params.items()},
-                'base_features':[k for k,w in base.items() if w.isChecked()] if base else list(BASE)}
+        checks = getattr(self, scope + '_feature_checks', {})
+        params = getattr(self, scope + '_feature_params', {})
+        base = getattr(self, scope + '_base_checks', {})
+        param_values = {}
+        for k, w in params.items():
+            if isinstance(w, QCheckBox):
+                param_values[k] = w.isChecked()
+            elif isinstance(w, QComboBox):
+                param_values[k] = w.currentText()
+            else:
+                param_values[k] = w.value()
+        return {
+            **{k: w.isChecked() for k, w in checks.items()},
+            **param_values,
+            'base_features': [k for k, w in base.items() if w.isChecked()] if base else list(BASE),
+        }
 
-    def _restore_feature_options(self,scope,config):
-        values=feature_options(config)
-        for k,w in getattr(self,scope+'_base_checks',{}).items():
-            w.blockSignals(True);w.setChecked(k in values['base_features']);w.blockSignals(False)
-        for k,w in getattr(self,scope+'_feature_checks',{}).items():
-            w.blockSignals(True);w.setChecked(values[k] if w.isEnabled() else False);w.blockSignals(False)
-        for k,w in getattr(self,scope+'_feature_params',{}).items():
+    def _restore_feature_options(self, scope, config):
+        values = feature_options(config)
+        for k, w in getattr(self, scope + '_base_checks', {}).items():
             w.blockSignals(True)
-            if isinstance(w,QComboBox):w.setCurrentText(values[k])
-            else:w.setValue(values[k])
+            w.setChecked(k in values['base_features'])
             w.blockSignals(False)
+        for k, w in getattr(self, scope + '_feature_checks', {}).items():
+            w.blockSignals(True)
+            w.setChecked(values[k] if w.isEnabled() else False)
+            w.blockSignals(False)
+        for k, w in getattr(self, scope + '_feature_params', {}).items():
+            w.blockSignals(True)
+            if isinstance(w, QCheckBox):
+                w.setChecked(bool(values.get(k, False)))
+            elif isinstance(w, QComboBox):
+                w.setCurrentText(values[k])
+            else:
+                w.setValue(values[k])
+            w.blockSignals(False)
+        params = getattr(self, scope + '_feature_params', {})
+        if 'cfs' in params and 'cfs_max_features' in params:
+            params['cfs_max_features'].setEnabled(params['cfs'].isChecked())
 
-    def _features_changed(self,scope):
-        if getattr(self,'_building',False): return
-        if scope=='batch':
-            if hasattr(self,'batch_summary'):self._batch_changed()
-            return
-        if hasattr(self,'window_model') and hasattr(self,'export_model'):
-            self._invalidate_windows()
-        elif hasattr(self,'windowing_applied'):
-            self.windowing_applied=False;self.window_config=None
-        self.statusBar().showMessage('Feature settings changed — APPLY WINDOWING again.')
-        if hasattr(self,'publish_info'):self.publish_info.setText('Feature settings changed: APPLY WINDOWING again, then preview/export.')
-        if hasattr(self,'extra_feature_table'):self.extra_feature_table.setRowCount(0)
-        self._reset_analysis_feature_labels()
-        self._update_feature_summary()
-
-    def _show_selected_window_features(self,wid,meta,sensor,axis,values):
-        config=self.window_config or self.capture_config();axis_name=dict(X='Forward',Y='Vertical',Z='Lateral')[axis]
-        display={k.replace('_',' '):values[k.replace('_',' ')] for k in axis_names(config) if k not in BASE}
-        idx=next(i for i,m in enumerate(self.window_metadata) if int(m['Window_ID'])==int(wid))
-        history=feature_options(config)['temporal_history'];start=max(0,idx-history+1)
-        records=list(window_feature_records(self.window_signal_data[start:idx+1],self.window_metadata[start:idx+1],float(self.windowing_sampling_rate),config))
-        shared=records[-1][2]
-        for key,value in shared.items():
-            if key.startswith(sensor+'_Magnitude_') or key.startswith(f'{sensor}_{axis_name}_') or '_Corr_' in key:
-                display[key]=value
+    def _show_selected_window_features(self, wid, meta, sensor, axis, values):
+        config = self.window_config or self.capture_config()
+        axis_name = dict(X='Forward', Y='Vertical', Z='Lateral')[axis]
+        display = {k.replace('_', ' '): values[k.replace('_', ' ')] for k in axis_names(config) if k not in BASE}
+        idx = next(i for i, m in enumerate(self.window_metadata) if int(m['Window_ID']) == int(wid))
+        history = feature_options(config)['temporal_history']
+        start = max(0, idx - history + 1)
+        records = list(window_feature_records(self.window_signal_data[start:idx + 1], self.window_metadata[start:idx + 1], float(self.windowing_sampling_rate), config))
+        shared = records[-1][2]
+        for key, value in shared.items():
+            if key.startswith(sensor + '_') or '_Corr_' in key:
+                display[key] = value
         self._show_extra_features(display)
         self.analysis_time_stats.setText(f'{len(axis_names(config))} selected axis features · {len(display)} additional/context values')
 
-    def _show_extra_features(self,values):
-        if not hasattr(self,'extra_feature_table'):return
+    def _show_extra_features(self, values):
+        if not hasattr(self, 'extra_feature_table'):
+            return
         self.extra_feature_table.setRowCount(len(values))
-        for row,(key,value) in enumerate(values.items()):
-            normalized=key.replace(' ','_')
-            if normalized.startswith('CWT_FOG_Index_'):unit='%'
-            elif normalized.endswith('Lag_s'):unit='s'
-            elif 'Relative_Energy' in normalized or 'Ratio' in normalized or 'Freeze_Index' in normalized or 'Entropy' in normalized or 'Skewness' in normalized or 'Kurtosis' in normalized or 'Corr' in normalized or 'Flatness' in normalized or 'Crest' in normalized:unit='—'
-            elif normalized.endswith('Lag_s'):unit='s'
-            elif 'Jerk' in normalized or 'Trend_g_s' in normalized:unit='g/s'
-            elif 'Centroid' in normalized or 'Spread' in normalized:unit='Hz'
-            elif 'Energy' in normalized:unit='g²'
-            elif normalized.startswith('Wavelet_') and normalized.endswith('_Std'):unit='g'
-            elif 'Magnitude' in normalized or 'Delta_RMS' in normalized:unit='g'
-            else:unit='—'
-            for col,text in enumerate([key,f'{value:.6g}' if np.isfinite(value) else 'N/A',unit]):
-                self.extra_feature_table.setItem(row,col,QTableWidgetItem(text))
+        for row, (key, value) in enumerate(values.items()):
+            normalized = key.replace(' ', '_')
+            if 'CWT_FOG_Index_' in normalized:
+                unit = '%'
+            elif normalized.endswith('Lag_s'):
+                unit = 's'
+            elif any(t in normalized for t in ('Centroid', 'Spread', 'Freq_Std_', 'Peak_Freq_', 'Spectral_CoM')):
+                unit = 'Hz'
+            elif any(t in normalized for t in ('Mean_Locomotor', 'Std_Locomotor', 'Mean_Freeze', 'Std_Freeze', 'Peak_Amp_')):
+                unit = 'g²/Hz'
+            elif normalized.endswith('Integrals'):
+                unit = 'g·s'
+            elif 'Jerk' in normalized or 'Trend_g_s' in normalized:
+                unit = 'g/s'
+            elif 'Energy' in normalized and 'Relative' not in normalized and 'Ratio' not in normalized:
+                unit = 'g²'
+            elif (normalized.startswith('Wavelet_') and normalized.endswith('_Std')) or 'Magnitude' in normalized or 'Delta_RMS' in normalized or 'Increments' in normalized or 'Diff_Inc_' in normalized:
+                unit = 'g'
+            else:
+                unit = '—'
+            for col, text in enumerate([key, f'{value:.6g}' if np.isfinite(value) else 'N/A', unit]):
+                self.extra_feature_table.setItem(row, col, QTableWidgetItem(text))
 
     def _create_export_page(self):
         page, layout = self._heading_page('EXPORT FEATURES')
@@ -3088,8 +3179,10 @@ class FOGSignalAnalyzer(QMainWindow):
         try:
             c = self.capture_batch_config()
             v = c['controls']
+            fo = feature_options(c)
+            cfs_text = f" · CFS ON (max {fo['cfs_max_features']})" if fo.get('cfs') else ''
             n = len(feature_names(c))
-            self.batch_summary.setText(f"{len(self.batch_files)} files · {', '.join(c['sensors'])} · {', '.join(c['axes'])} · {n} features/window · Window {v['window_length_spinbox']:g}s · Overlap {v['window_overlap_spinbox']:g}% · {sum((len(r) for r in self.excluded_regions.values()))} exclusion regions")
+            self.batch_summary.setText(f"{len(self.batch_files)} files · {', '.join(c['sensors'])} · {', '.join(c['axes'])} · {n} features/window{cfs_text} · Window {v['window_length_spinbox']:g}s · Overlap {v['window_overlap_spinbox']:g}% · {sum((len(r) for r in self.excluded_regions.values()))} exclusion regions")
         except Exception as exc:
             self.batch_summary.setText('CONFIG: ' + str(exc))
 

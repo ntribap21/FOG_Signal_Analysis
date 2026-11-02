@@ -5,6 +5,20 @@ from scipy import signal, stats
 RELEASE_VERSION = 'fog-unified-1.4-cwt'
 BASE = ['Mean','RMS','Std','Variance','Min','Max','SMA','Dominant_Frequency',
         'Total_Power','Loco_Power','Freeze_Power','Freeze_Index','Low_Freq_Ratio','PSE']
+RODRIGUEZ_AXIS_FEATURES = [
+    'Mean_Locomotor', 'Std_Locomotor', 'Entropy_Locomotor',
+    'Mean_Freeze', 'Std_Freeze', 'Entropy_Freeze',
+    'Freq_Std_Low', 'Freq_Std_High',
+    *[f'AR_{i}' for i in range(1, 13)],
+    'Integrals',
+    'Peak_Amp_Locomotor', 'Peak_Freq_Locomotor',
+    'Peak_Amp_Freeze', 'Peak_Freq_Freeze',
+]
+RODRIGUEZ_WINDOW_FEATURES = [
+    'Spectral_CoM', 'Increments_AP',
+    'Diff_Inc_XY', 'Diff_Inc_XZ', 'Diff_Inc_YZ',
+    'PCA_1', 'PCA_2', 'PCA_3',
+]
 GROUPS = {
     'skewness': 'Skewness', 'spectral_shape': 'Spectral centroid / spread / flatness',
     'harmonic': 'Spectral even / odd harmonic ratio', 'wavelet': 'DWT energy / std / entropy',
@@ -15,45 +29,63 @@ GROUPS = {
     'corr': 'Within-sensor Pearson correlation (lag 0)',
     'crosscorr': 'Between-sensor magnitude cross-correlation',
     'ater': 'Log Ankle-to-Trunk energy ratio (loco / freeze)',
-    'cwt': 'CWT db4 FOG index (signed + absolute)',
+    'cwt': 'CWT db4 FOG index — Forward/Anterior only (signed + absolute)',
+    'rodriguez_axis': 'Rodriguez/Mazilu per-axis (Loco/Freeze stats, Freq Std, AR1-12, Integrals, Peaks)',
+    'rodriguez_window': 'Rodriguez/Ahlrichs multi-axis (Spectral CoM 0.1-8Hz, Increments, PCA 1-3)',
 }
 AXES = ('Forward','Vertical','Lateral')
 SENSORS = ('Ankle','Thigh','Trunk')
 PER_AXIS = {'jerk':['Jerk_RMS'], 'sampen':['Sample_Entropy'],
             'apen':['Approx_Entropy'], 'autocorr':['Autocorr_Peak','Autocorr_Lag_s'],
             'skewness':['Skewness'], 'spectral_shape':['Spectral_Centroid','Spectral_Spread','Spectral_Flatness'],
-            'harmonic':['Harmonic_Even_Odd_Ratio'], 'kurtosis':['Kurtosis_Excess'], 'crest':['Crest_Factor_Centered']}
-DEFAULTS = dict(entropy_m=2, entropy_r_ratio=0.2, autocorr_min_s=0.35,
-                autocorr_max_s=1.0, crosscorr_max_s=0.25, ater_epsilon_g2=1e-8, wavelet_name='db4', wavelet_level=4,
-                wavelet_mode='symmetric', magnitude_mode='dynamic', harmonic_f0_hz=1.0,
-                harmonic_count=8, temporal_history=3)
+            'harmonic':['Harmonic_Even_Odd_Ratio'], 'kurtosis':['Kurtosis_Excess'], 'crest':['Crest_Factor_Centered'],
+            'rodriguez_axis': RODRIGUEZ_AXIS_FEATURES}
+DEFAULTS = dict(
+    entropy_m=2, entropy_r_ratio=0.2, autocorr_min_s=0.35,
+    autocorr_max_s=1.0, crosscorr_max_s=0.25, ater_epsilon_g2=1e-8,
+    wavelet_name='db4', wavelet_level=4, wavelet_mode='symmetric',
+    magnitude_mode='dynamic', harmonic_f0_hz=1.0, harmonic_count=8,
+    temporal_history=3, cfs=False, cfs_max_features=30
+)
 
 def options(config):
-    v=config.get('feature_options', {})
-    if not isinstance(v,dict) or set(v)-set(GROUPS)-set(DEFAULTS)-{'base_features'}:
+    v = config.get('feature_options', {})
+    if not isinstance(v, dict) or set(v) - set(GROUPS) - set(DEFAULTS) - {'base_features'}:
         raise ValueError('Feature options không hợp lệ; chỉ hỗ trợ các nhóm trong registry.')
-    out=dict(DEFAULTS)
-    base=v.get('base_features',BASE)
-    if not isinstance(base,list) or any(k not in BASE for k in base) or len(base)!=len(set(base)):
+    out = dict(DEFAULTS)
+    base = v.get('base_features', BASE)
+    if not isinstance(base, list) or any(k not in BASE for k in base) or len(base) != len(set(base)):
         raise ValueError('Danh sách đặc trưng cơ bản không hợp lệ.')
-    out['base_features']=[k for k in BASE if k in base]
+    out['base_features'] = [k for k in BASE if k in base]
     for k in GROUPS:
-        if k in v and not isinstance(v[k],bool): raise ValueError(k+' cần true/false')
-        out[k]=v.get(k,False)
-    out.update({k:v[k] for k in DEFAULTS if k in v})
-    if not isinstance(out['entropy_m'],int) or not 1<=out['entropy_m']<=3: raise ValueError('entropy_m phải 1..3')
+        if k in v and not isinstance(v[k], bool):
+            raise ValueError(k + ' cần true/false')
+        out[k] = v.get(k, False)
+    if 'cfs' in v and not isinstance(v['cfs'], bool):
+        raise ValueError('cfs cần true/false')
+    out.update({k: v[k] for k in DEFAULTS if k in v})
+    if not isinstance(out['entropy_m'], int) or not 1 <= out['entropy_m'] <= 3:
+        raise ValueError('entropy_m phải 1..3')
     for k in DEFAULTS:
-        if isinstance(DEFAULTS[k],str): continue
-        if not isinstance(out[k],(int,float)) or isinstance(out[k],bool) or not np.isfinite(out[k]): raise ValueError('Feature parameter không hữu hạn: '+k)
-    if not 0<out['entropy_r_ratio']<=1: raise ValueError('Entropy tolerance phải trong (0,1]')
-    if not 0<out['autocorr_min_s']<out['autocorr_max_s']: raise ValueError('Autocorr lag không hợp lệ')
-    if not 0<out['crosscorr_max_s']<=1 or out['ater_epsilon_g2']<=0: raise ValueError('Cross-correlation / ATER parameter không hợp lệ')
-    if out['wavelet_name'] not in ('db4','db8') or out['wavelet_mode'] not in ('symmetric','periodization'):
+        if isinstance(DEFAULTS[k], (str, bool)):
+            continue
+        if not isinstance(out[k], (int, float)) or isinstance(out[k], bool) or not np.isfinite(out[k]):
+            raise ValueError('Feature parameter không hữu hạn: ' + k)
+    if not 0 < out['entropy_r_ratio'] <= 1:
+        raise ValueError('Entropy tolerance phải trong (0,1]')
+    if not 0 < out['autocorr_min_s'] < out['autocorr_max_s']:
+        raise ValueError('Autocorr lag không hợp lệ')
+    if not 0 < out['crosscorr_max_s'] <= 1 or out['ater_epsilon_g2'] <= 0:
+        raise ValueError('Cross-correlation / ATER parameter không hợp lệ')
+    if out['wavelet_name'] not in ('db4', 'db8') or out['wavelet_mode'] not in ('symmetric', 'periodization'):
         raise ValueError('Wavelet / extension mode không hợp lệ.')
-    for key,lo,hi in [('wavelet_level',1,5),('harmonic_count',2,20),('temporal_history',2,20)]:
-        if type(out[key]) is not int or not lo<=out[key]<=hi: raise ValueError(key+' ngoài giới hạn.')
-    if out['harmonic_f0_hz']<=0: raise ValueError('Harmonic f0 phải >0.')
-    if out['magnitude_mode'] not in ('dynamic','input'): raise ValueError('Magnitude mode không hợp lệ.')
+    for key, lo, hi in [('wavelet_level', 1, 5), ('harmonic_count', 2, 20), ('temporal_history', 2, 20), ('cfs_max_features', 1, 500)]:
+        if type(out[key]) is not int or not lo <= out[key] <= hi:
+            raise ValueError(key + ' ngoài giới hạn.')
+    if out['harmonic_f0_hz'] <= 0:
+        raise ValueError('Harmonic f0 phải >0.')
+    if out['magnitude_mode'] not in ('dynamic', 'input'):
+        raise ValueError('Magnitude mode không hợp lệ.')
     return out
 
 def axis_names(config):
@@ -92,6 +124,10 @@ def window_names(config):
             raise ValueError('Nhánh CWT yêu cầu phải chọn trục Forward (Anterior-Posterior).')
         from cwt_features import FEATURE_NAMES
         out.extend(f'{s}_Forward_{f}' for s in config['sensors'] for f in FEATURE_NAMES)
+    if o['rodriguez_window']:
+        if set(config['axes']) != set(AXES):
+            raise ValueError('Nhóm Rodriguez/Ahlrichs multi-axis cần chọn đủ 3 trục (Forward, Vertical, Lateral).')
+        out.extend(f'{s}_{key}' for s in config['sensors'] for key in RODRIGUEZ_WINDOW_FEATURES)
     return out
 
 def feature_names(config):
@@ -117,6 +153,52 @@ def entropy(x,m,r_ratio,approx=False):
         diff=np.abs(v[i+1:]-v[i]); match=np.max(diff[:,:m],axis=1)<=r_ratio
         B+=int(match.sum()); A+=int((match & (diff[:,m]<=r_ratio)).sum())
     return float(-np.log(A/B)) if A>0 and B>0 else np.nan
+
+def _ar_yule_walker(xc, order=12):
+    n = len(xc)
+    if n <= order:
+        return [np.nan] * order
+    r = np.array([np.dot(xc[:n - k], xc[k:]) / n for k in range(order + 1)], dtype=float)
+    if r[0] <= 1e-24 or not np.isfinite(r).all():
+        return [np.nan] * order
+    a = np.zeros(order + 1, dtype=float)
+    e = r[0]
+    for k in range(1, order + 1):
+        acc = r[k] - np.dot(a[1:k], r[k - 1:0:-1])
+        if abs(e) <= 1e-24:
+            return [np.nan] * order
+        lam = acc / e
+        if not np.isfinite(lam) or abs(lam) >= 1.0:
+            return [np.nan] * order
+        a_new = a.copy()
+        a_new[k] = lam
+        for j in range(1, k):
+            a_new[j] = a[j] - lam * a[k - j]
+        a = a_new
+        e *= (1.0 - lam * lam)
+    return [float(v) for v in a[1:]]
+
+def _band_stats_and_peaks(f, p, lo, hi):
+    mask = (f >= lo) & (f <= hi)
+    fb, pb = f[mask], p[mask]
+    if len(pb) == 0 or float(np.sum(pb)) <= 1e-24:
+        return np.nan, np.nan, np.nan, np.nan, np.nan
+    mean_v = float(np.mean(pb))
+    std_v = float(np.std(pb))
+    prob = pb / np.sum(pb)
+    prob = prob[prob > 0]
+    ent_v = float(-np.sum(prob * np.log2(prob))) if len(prob) else 0.0
+    idx = int(np.argmax(pb))
+    return mean_v, std_v, ent_v, float(pb[idx]), float(fb[idx])
+
+def _freq_std_band(f, p, lo, hi):
+    mask = (f >= lo) & (f <= hi)
+    fb, pb = f[mask], p[mask]
+    total = float(np.sum(pb))
+    if len(fb) < 2 or total <= 1e-24:
+        return np.nan
+    centroid = float(np.sum(fb * pb) / total)
+    return float(np.sqrt(np.sum(((fb - centroid) ** 2) * pb) / total))
 
 def axis_extra(x,fs,config):
     o=options(config); x=np.asarray(x,float)
@@ -159,6 +241,26 @@ def axis_extra(x,fs,config):
             ac=signal.correlate(xc,xc,mode='full',method='auto')[len(x)-1:]/energy
             k=lo+int(np.argmax(ac[lo:hi+1]));peak=float(ac[k]);lag=k/fs
         out.update(Autocorr_Peak=peak,Autocorr_Lag_s=lag)
+    if o['rodriguez_axis']:
+        f_psd, p_psd = window_psd(x, fs)
+        m_loco, s_loco, e_loco, pa_loco, pf_loco = _band_stats_and_peaks(f_psd, p_psd, 0.5, 3.0)
+        m_free, s_free, e_free, pa_free, pf_free = _band_stats_and_peaks(f_psd, p_psd, 3.0, 8.0)
+        f_fft = np.fft.rfftfreq(len(xc), 1.0 / fs)
+        p_fft = (np.abs(np.fft.rfft(xc)) ** 2) / len(xc)
+        fstd_low = _freq_std_band(f_fft, p_fft, 0.1, 0.68)
+        fstd_high = _freq_std_band(f_fft, p_fft, 8.0, min(20.0, fs / 2.0))
+        ar_coeffs = _ar_yule_walker(xc, order=12) if not flat else [np.nan] * 12
+        integ_fn = getattr(np, 'trapezoid', np.trapz)
+        integral_val = float(integ_fn(np.abs(xc), dx=1.0 / fs))
+        out.update(
+            Mean_Locomotor=m_loco, Std_Locomotor=s_loco, Entropy_Locomotor=e_loco,
+            Mean_Freeze=m_free, Std_Freeze=s_free, Entropy_Freeze=e_free,
+            Freq_Std_Low=fstd_low, Freq_Std_High=fstd_high,
+            **{f'AR_{i}': ar_coeffs[i - 1] for i in range(1, 13)},
+            Integrals=integral_val,
+            Peak_Amp_Locomotor=pa_loco, Peak_Freq_Locomotor=pf_loco,
+            Peak_Amp_Freeze=pa_free, Peak_Freq_Freeze=pf_free,
+        )
     return out
 
 def corr(u,v):
@@ -190,6 +292,7 @@ def window_extra(signals,fs,config,channel_values):
         for a,b in pairs(config):
             u=mags[a];v=mags[b]; lim=min(int(o['crosscorr_max_s']*fs),len(u)//2)
             ks=np.arange(-lim,lim+1);vals=[]
+            # Positive lag pairs a[n] with b[n+k]. At least half a window overlaps.
             for k in ks:
                 uu,vv=(u[:len(u)-k],v[k:]) if k>=0 else (u[-k:],v[:len(v)+k])
                 vals.append(corr(uu,vv))
@@ -210,6 +313,42 @@ def window_extra(signals,fs,config,channel_values):
             cwt_vals = cwt_features(signals[f'{s}_Forward_mg'], fs)
             for k, v in cwt_vals.items():
                 out[f'{s}_Forward_{k}'] = v
+    if o['rodriguez_window']:
+        if set(config['axes']) != set(AXES):
+            raise ValueError('Nhóm Rodriguez/Ahlrichs multi-axis cần chọn đủ 3 trục (Forward, Vertical, Lateral).')
+        for sensor in config['sensors']:
+            ax_x = np.asarray(signals[f'{sensor}_Forward_mg'], float)
+            ax_y = np.asarray(signals[f'{sensor}_Vertical_mg'], float)
+            ax_z = np.asarray(signals[f'{sensor}_Lateral_mg'], float)
+            fx, px = window_psd(ax_x, fs)
+            _, py = window_psd(ax_y, fs)
+            _, pz = window_psd(ax_z, fs)
+            p_sum = px + py + pz
+            mask_com = (fx >= 0.1) & (fx <= 8.0)
+            tot_com = float(np.sum(p_sum[mask_com]))
+            spec_com = float(np.sum(fx[mask_com] * p_sum[mask_com]) / tot_com) if tot_com > 1e-24 else np.nan
+            inc_x = float(np.mean(np.abs(np.diff(ax_x))))
+            inc_y = float(np.mean(np.abs(np.diff(ax_y))))
+            inc_z = float(np.mean(np.abs(np.diff(ax_z))))
+            mat = np.column_stack([ax_x - ax_x.mean(), ax_y - ax_y.mean(), ax_z - ax_z.mean()])
+            cov = (mat.T @ mat) / max(len(ax_x) - 1, 1)
+            eigvals = np.linalg.eigvalsh(cov)[::-1]
+            eigvals = np.maximum(eigvals, 0.0)
+            eig_sum = float(np.sum(eigvals))
+            if eig_sum > 1e-24:
+                pca1, pca2, pca3 = (float(eigvals[0] / eig_sum), float(eigvals[1] / eig_sum), float(eigvals[2] / eig_sum))
+            else:
+                pca1 = pca2 = pca3 = np.nan
+            out.update({
+                f'{sensor}_Spectral_CoM': spec_com,
+                f'{sensor}_Increments_AP': inc_x,
+                f'{sensor}_Diff_Inc_XY': inc_x - inc_y,
+                f'{sensor}_Diff_Inc_XZ': inc_x - inc_z,
+                f'{sensor}_Diff_Inc_YZ': inc_y - inc_z,
+                f'{sensor}_PCA_1': pca1,
+                f'{sensor}_PCA_2': pca2,
+                f'{sensor}_PCA_3': pca3,
+            })
     return out
 
 

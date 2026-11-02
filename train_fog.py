@@ -11,7 +11,7 @@ import sklearn
 import argparse
 from sklearn.ensemble import RandomForestClassifier, AdaBoostClassifier
 from sklearn.tree import DecisionTreeClassifier
-from sklearn.base import clone
+from sklearn.base import clone, BaseEstimator, TransformerMixin
 from sklearn.metrics import accuracy_score, average_precision_score, balanced_accuracy_score, classification_report, confusion_matrix, f1_score, roc_auc_score
 from sklearn.model_selection import GridSearchCV, GroupShuffleSplit, StratifiedGroupKFold, LeaveOneGroupOut
 from sklearn.pipeline import Pipeline
@@ -19,11 +19,112 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from sklearn.svm import SVC
 from scipy.signal import medfilt
+
 FEATURES = ['Mean', 'RMS', 'Std', 'Variance', 'Min', 'Max', 'SMA', 'Dominant_Frequency', 'Total_Power', 'Loco_Power', 'Freeze_Power', 'Freeze_Index', 'Low_Freq_Ratio', 'PSE']
 SENSORS = ['Ankle', 'Thigh', 'Trunk']
 AXES = ['Forward', 'Vertical', 'Lateral']
 ALIASES = {'subject_id': 'Subject_ID', 'Subject': 'Subject_ID', 'recording_id': 'Recording_ID', 'Recording': 'Recording_ID', 'segment_id': 'Segment_ID', 'window_id': 'Window_ID', 'window_start': 'Start_Time', 'window_end': 'End_Time', 'fog_ratio': 'FOG_Ratio', 'config_id': 'Config_ID', 'y': 'Binary_Label'}
 META = ['Subject_ID', 'Recording_ID', 'Segment_ID', 'Window_ID', 'Start_Time', 'End_Time']
+
+class CFSSelector(BaseEstimator, TransformerMixin):
+    """Correlation-based Feature Subset Selection (Hall 1999 / Mazilu 2012).
+    Tối đa hóa hệ số Merit: M_S = (k * r_cf) / sqrt(k + k * (k - 1) * r_ff)
+    bằng tìm kiếm tiến (Forward Best-First Search) độc lập trên từng tập train.
+    """
+    def __init__(self, max_features=30, min_backtrack=5):
+        self.max_features = max_features
+        self.min_backtrack = min_backtrack
+
+    def fit(self, X, y):
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float).ravel()
+        n_samples, n_features = X.shape
+        if n_features == 0:
+            raise ValueError('CFSSelector nhận ma trận X rỗng.')
+
+        # Chuẩn hóa Z-score trên từng cột để tính nhanh ma trận tương quan Pearson bằng tích vô hướng
+        x_mean = np.nanmean(X, axis=0)
+        X_centered = np.where(np.isnan(X), 0.0, X - x_mean)
+        x_std = np.sqrt(np.sum(X_centered ** 2, axis=0))
+        valid_cols = x_std > 1e-12
+
+        X_norm = np.zeros_like(X_centered)
+        X_norm[:, valid_cols] = X_centered[:, valid_cols] / x_std[valid_cols]
+
+        y_centered = y - np.mean(y)
+        y_std = np.sqrt(np.sum(y_centered ** 2))
+        if y_std <= 1e-12:
+            raise ValueError('Nhãn y trong tập fit đồng nhất, không thể tính tương quan CFS.')
+        y_norm = y_centered / y_std
+
+        # Tương quan giữa từng đặc trưng với nhãn FOG: r_cf
+        r_cf = np.abs(X_norm.T @ y_norm)
+        r_cf[~valid_cols] = 0.0
+
+        # Ma trận tương quan giữa các đặc trưng với nhau: r_ff
+        r_ff = np.abs(X_norm.T @ X_norm)
+        np.fill_diagonal(r_ff, 0.0)
+
+        limit = min(int(self.max_features), int(np.sum(valid_cols))) if self.max_features else int(np.sum(valid_cols))
+        if limit < 1:
+            self.support_mask_ = np.ones(n_features, dtype=bool)
+            self.selected_indices_ = np.arange(n_features, dtype=int)
+            return self
+
+        selected = []
+        best_selected = []
+        best_merit = -1.0
+        stagnation = 0
+        remaining = set(np.flatnonzero(valid_cols).tolist())
+
+        sum_rcf = 0.0
+        sum_rff = 0.0
+
+        while remaining and len(selected) < limit:
+            k = len(selected) + 1
+            best_cand = None
+            best_cand_merit = -1.0
+            best_cand_rff = 0.0
+
+            for c in remaining:
+                cand_rcf = sum_rcf + r_cf[c]
+                cand_rff = sum_rff + (float(np.sum(r_ff[c, selected])) if selected else 0.0)
+                denom = np.sqrt(k + 2.0 * cand_rff)
+                merit = (cand_rcf / denom) if denom > 1e-12 else 0.0
+                if merit > best_cand_merit:
+                    best_cand_merit = merit
+                    best_cand = c
+                    best_cand_rff = cand_rff
+
+            if best_cand is None:
+                break
+
+            selected.append(best_cand)
+            remaining.remove(best_cand)
+            sum_rcf += r_cf[best_cand]
+            sum_rff = best_cand_rff
+
+            if best_cand_merit > best_merit + 1e-6:
+                best_merit = best_cand_merit
+                best_selected = list(selected)
+                stagnation = 0
+            else:
+                stagnation += 1
+                if stagnation >= self.min_backtrack:
+                    break
+
+        if not best_selected:
+            best_selected = [int(np.argmax(r_cf))]
+
+        self.selected_indices_ = np.sort(np.asarray(best_selected, dtype=int))
+        self.support_mask_ = np.zeros(n_features, dtype=bool)
+        self.support_mask_[self.selected_indices_] = True
+        self.best_merit_ = float(best_merit)
+        return self
+
+    def transform(self, X):
+        X = np.asarray(X, dtype=float)
+        return X[:, self.support_mask_]
 
 def discover_inputs(inputs):
     result = []
@@ -304,48 +405,133 @@ def _split(data, test_size, seed, test_subjects):
 from scipy.signal import medfilt
 
 def _positive_odd_int(value):
-  try:
-    k = int(value)
-  except ValueError as exc:
-    raise argparse.ArgumentTypeError(
-        'median-filter phải là số nguyên lẻ >= 1.'
-    ) from exc
-  if k < 1 or k % 2 == 0:
-    raise argparse.ArgumentTypeError(
-        'median-filter phải là số nguyên lẻ dương (1=tắt, 3, 5, 15, 31...).'
-    )
-  return k
+    try:
+        k = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError('median-filter phải là số nguyên lẻ >= 1.') from exc
+    if k < 1 or k % 2 == 0:
+        raise argparse.ArgumentTypeError('median-filter phải là số nguyên lẻ dương (1=tắt, 3, 5, 15, 31...).')
+    return k
 
 
 def apply_median_postprocessing(manifest_df, raw_predictions, kernel_size=1):
-  raw = np.asarray(raw_predictions, dtype=np.int8)
-  if kernel_size is None or int(kernel_size) <= 1:
-    return raw.copy()
-  kernel_size = int(kernel_size)
-  if kernel_size < 1 or kernel_size % 2 == 0:
-    raise ValueError('Kích thước median_filter phải là số nguyên lẻ >= 1.')
-  if len(manifest_df) != len(raw):
-    raise ValueError('Chiều dài manifest_df và raw_predictions không khớp.')
+    raw = np.asarray(raw_predictions, dtype=np.int8)
+    if kernel_size is None or int(kernel_size) <= 1:
+        return raw.copy()
+    kernel_size = int(kernel_size)
+    if kernel_size < 1 or kernel_size % 2 == 0:
+        raise ValueError('Kích thước median_filter phải là số nguyên lẻ >= 1.')
+    smoothed = raw.copy()
+    work = manifest_df[['Subject_ID', 'Recording_ID', 'Segment_ID', 'Window_ID']].copy()
+    work['_idx'] = np.arange(len(work))
+    for _, group in work.groupby(['Subject_ID', 'Recording_ID', 'Segment_ID'], sort=False):
+        ordered = group.sort_values('Window_ID', kind='stable')
+        idx = ordered['_idx'].to_numpy()
+        n = len(idx)
+        if n >= 3:
+            k = min(kernel_size, n if n % 2 == 1 else n - 1)
+            if k >= 3:
+                smoothed[idx] = medfilt(smoothed[idx].astype(float), kernel_size=k).astype(np.int8)
+    return smoothed
 
-  smoothed = raw.copy()
-  work = manifest_df[
-      ['Subject_ID', 'Recording_ID', 'Segment_ID', 'Window_ID']
-  ].copy()
-  work['_idx'] = np.arange(len(work))
+class CFSSelector(BaseEstimator, TransformerMixin):
+    """Correlation-based Feature Subset Selection (Hall 1999 / Mazilu 2012)."""
+    def __init__(self, max_features=30, min_backtrack=5):
+        self.max_features = max_features
+        self.min_backtrack = min_backtrack
 
-  for _, group in work.groupby(
-      ['Subject_ID', 'Recording_ID', 'Segment_ID'], sort=False
-  ):
-    ordered = group.sort_values('Window_ID', kind='stable')
-    idx = ordered['_idx'].to_numpy()
-    n = len(idx)
-    if n >= 3:
-      k = min(kernel_size, n if n % 2 == 1 else n - 1)
-      if k >= 3:
-        smoothed[idx] = medfilt(
-            smoothed[idx].astype(float), kernel_size=k
-        ).astype(np.int8)
-  return smoothed
+    def fit(self, X, y):
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float).ravel()
+        n_samples, n_features = X.shape
+        if n_features == 0:
+            raise ValueError('CFSSelector nhận ma trận X rỗng.')
+        x_mean = np.nanmean(X, axis=0)
+        X_centered = np.where(np.isnan(X), 0.0, X - x_mean)
+        x_std = np.sqrt(np.sum(X_centered ** 2, axis=0))
+        valid_cols = x_std > 1e-12
+        X_norm = np.zeros_like(X_centered)
+        X_norm[:, valid_cols] = X_centered[:, valid_cols] / x_std[valid_cols]
+
+        y_centered = y - np.mean(y)
+        y_std = np.sqrt(np.sum(y_centered ** 2))
+        if y_std <= 1e-12:
+            raise ValueError('Nhãn y trong tập fit đồng nhất, không thể tính tương quan CFS.')
+        y_norm = y_centered / y_std
+
+        r_cf = np.abs(X_norm.T @ y_norm)
+        r_cf[~valid_cols] = 0.0
+        r_ff = np.abs(X_norm.T @ X_norm)
+        np.fill_diagonal(r_ff, 0.0)
+
+        limit = min(int(self.max_features), int(np.sum(valid_cols))) if self.max_features else int(np.sum(valid_cols))
+        if limit < 1:
+            self.support_mask_ = np.ones(n_features, dtype=bool)
+            self.selected_indices_ = np.arange(n_features, dtype=int)
+            self.best_merit_ = 0.0
+            return self
+
+        selected, best_selected = [], []
+        best_merit = -1.0
+        stagnation = 0
+        remaining = set(np.flatnonzero(valid_cols).tolist())
+        sum_rcf = 0.0
+        sum_rff = 0.0
+
+        while remaining and len(selected) < limit:
+            k = len(selected) + 1
+            best_cand = None
+            best_cand_merit = -1.0
+            best_cand_rff = 0.0
+            for c in remaining:
+                cand_rcf = sum_rcf + r_cf[c]
+                cand_rff = sum_rff + (float(np.sum(r_ff[c, selected])) if selected else 0.0)
+                denom = np.sqrt(k + 2.0 * cand_rff)
+                merit = (cand_rcf / denom) if denom > 1e-12 else 0.0
+                if merit > best_cand_merit:
+                    best_cand_merit = merit
+                    best_cand = c
+                    best_cand_rff = cand_rff
+            if best_cand is None:
+                break
+            selected.append(best_cand)
+            remaining.remove(best_cand)
+            sum_rcf += r_cf[best_cand]
+            sum_rff = best_cand_rff
+            if best_cand_merit > best_merit + 1e-6:
+                best_merit = best_cand_merit
+                best_selected = list(selected)
+                stagnation = 0
+            else:
+                stagnation += 1
+                if stagnation >= self.min_backtrack:
+                    break
+
+        if not best_selected:
+            best_selected = [int(np.argmax(r_cf))]
+        self.selected_indices_ = np.sort(np.asarray(best_selected, dtype=int))
+        self.support_mask_ = np.zeros(n_features, dtype=bool)
+        self.support_mask_[self.selected_indices_] = True
+        self.best_merit_ = float(best_merit)
+        return self
+
+    def transform(self, X):
+        X = np.asarray(X, dtype=float)
+        return X[:, self.support_mask_]
+    
+def _resolve_cfs_from_config(config_meta, cli_cfs, cli_max_features):
+    """Tự động bật CFS nếu người dùng đã tích chọn trên GUI (lưu trong config_json) hoặc truyền cờ --cfs."""
+    cfg_cfs = False
+    cfg_max = None
+    for c in (config_meta or {}).get('configurations', []):
+        if isinstance(c, dict):
+            fo = c.get('feature_options', {})
+            if isinstance(fo, dict) and fo.get('cfs'):
+                cfg_cfs = True
+                cfg_max = fo.get('cfs_max_features', 30)
+    use_cfs = bool(cli_cfs or cfg_cfs)
+    max_feat = int(cli_max_features if cli_cfs or cfg_max is None else cfg_max)
+    return use_cfs, max_feat
 
 def diagnostic_metrics(y_true, y_pred):
     truth = np.asarray(y_true)
@@ -525,7 +711,7 @@ def _save_validation(output, manifest, train_idx, y, groups, scores, fold_ids, f
     _write_json(output / 'validation_metrics.json', summary)
     return summary
 
-def train(paths, output, test_size=0.25, seed=42, *, kernel='rbf', C=1.0, gamma='scale', tune=False, cv_folds=3, test_subjects=None, n_jobs=1, cache_size=512.0, decision_threshold=0.0, threshold_tuning=False, min_sensitivity=0.85, min_specificity=0.85, threshold_method='grid', threshold_min=-1.5, threshold_max=0.5, threshold_step=0.02, inner_cv_folds=3, median_filter=1):
+def train(paths, output, test_size=0.25, seed=42, *, kernel='rbf', C=1.0, gamma='scale', tune=False, cv_folds=3, test_subjects=None, n_jobs=1, cache_size=512.0, decision_threshold=0.0, threshold_tuning=False, min_sensitivity=0.85, min_specificity=0.85, threshold_method='grid', threshold_min=-1.5, threshold_max=0.5, threshold_step=0.02, inner_cv_folds=3, median_filter=1, cfs=False, cfs_max_features=30):
     if kernel not in ('rbf', 'linear') or not np.isfinite(C) or C <= 0 or (not np.isfinite(cache_size)) or (cache_size <= 0):
         raise ValueError('Kernel phải là rbf/linear; C và cache-size phải >0.')
     if isinstance(gamma, (float, int)):
@@ -543,8 +729,16 @@ def train(paths, output, test_size=0.25, seed=42, *, kernel='rbf', C=1.0, gamma=
     if threshold_tuning and output.exists() and any(output.iterdir()):
         raise ValueError('Chọn thư mục output mới/rỗng cho validation để tránh trộn kết quả cũ.')
     data, names, config = load_datasets(paths)
+    cfs, cfs_max_features = _resolve_cfs_from_config(config, cfs, cfs_max_features)
     train_idx, test_idx = _split(data, test_size, seed, test_subjects)
-    pipeline = Pipeline([('imputer', SimpleImputer(strategy='median', add_indicator=True, keep_empty_features=True)), ('scaler', StandardScaler()), ('svm', SVC(kernel=kernel, C=C, gamma=gamma, class_weight='balanced', probability=False, cache_size=cache_size))])
+    steps = [
+        ('imputer', SimpleImputer(strategy='median', add_indicator=True, keep_empty_features=True)),
+        ('scaler', StandardScaler()),
+    ]
+    if cfs:
+        steps.append(('cfs', CFSSelector(max_features=cfs_max_features)))
+    steps.append(('svm', SVC(kernel=kernel, C=C, gamma=gamma, class_weight='balanced', probability=False, cache_size=cache_size)))
+    pipeline = Pipeline(steps)
     X_train, y_train = (data['X'][train_idx], data['y'][train_idx])
     train_groups = data['subject_id'][train_idx]
     print(f"{len(data['y']):,} windows · {len(names)} features · {len(np.unique(data['subject_id']))} subjects", flush=True)
@@ -709,7 +903,7 @@ def _outer_metrics(y, prediction, scores=None):
     result.update(fog_f1=float(f1_score(y, prediction, zero_division=0)) if n_positive else None, balanced_accuracy=(result['sensitivity'] + result['specificity']) / 2 if both_classes else None, roc_auc=float(roc_auc_score(y, scores)) if both_classes and scores is not None else None, average_precision=float(average_precision_score(y, scores)) if both_classes and scores is not None else None, confusion_matrix=confusion_matrix(y, prediction, labels=[0, 1]).tolist(), confusion_matrix_order=['Non-FOG', 'FOG'])
     return result
 
-def train_loso(paths, output, *, kernel='rbf', C=1.0, gamma='scale', seed=42, tune=False, threshold_tuning=False, cv_folds=3, n_jobs=1, cache_size=512.0, decision_threshold=0.0, min_sensitivity=0.85, min_specificity=0.85, threshold_method='grid', threshold_min=-1.5, threshold_max=0.5, threshold_step=0.02, C_grid=None, gamma_grid=None, save_models=True, save_all_sweeps=False, median_filter=1 ):
+def train_loso(paths, output, *, kernel='rbf', C=1.0, gamma='scale', seed=42, tune=False, threshold_tuning=False, cv_folds=3, n_jobs=1, cache_size=512.0, decision_threshold=0.0, min_sensitivity=0.85, min_specificity=0.85, threshold_method='grid', threshold_min=-1.5, threshold_max=0.5, threshold_step=0.02, C_grid=None, gamma_grid=None, save_models=True, save_all_sweeps=False, median_filter=1, cfs=False, cfs_max_features=30 ):
     _loso_options(kernel, C, gamma, cache_size, decision_threshold, min_sensitivity, min_specificity, n_jobs)
     if threshold_tuning and decision_threshold != 0.0:
         raise ValueError('Không đặt threshold khác 0 cùng chế độ tự chọn ngưỡng.')
@@ -721,6 +915,7 @@ def train_loso(paths, output, *, kernel='rbf', C=1.0, gamma='scale', seed=42, tu
     if output.exists() and any(output.iterdir()):
         raise ValueError('LOSO cần output mới/rỗng để tránh trộn các lượt đánh giá.')
     data, names, config = load_datasets(paths)
+    cfs, cfs_max_features = _resolve_cfs_from_config(config, cfs, cfs_max_features)
     X, y, groups = (data['X'], data['y'], data['subject_id'])
     if len(np.unique(groups)) < 2 or len(np.unique(y)) != 2:
         raise ValueError('LOSO cần >=2 bệnh nhân và cả hai lớp trong toàn dataset.')
@@ -734,10 +929,17 @@ def train_loso(paths, output, *, kernel='rbf', C=1.0, gamma='scale', seed=42, tu
     output.mkdir(parents=True, exist_ok=True)
     _write_json(output / 'dataset_info.json', config)
     _write_json(output / 'feature_names.json', names)
-    settings = {'model_type': 'svm', 'model_name': 'SVM', 'score_units': 'SVM decision score', 'evaluation': 'loso', 'trainer_version': TRAINER_VERSION, 'outer_folds': len(outer_folds), 'inner_cv': 'SGKF' if needs_inner else None, 'inner_cv_folds': cv_folds if needs_inner else None, 'cv_levels': 2 if needs_inner else 1, 'tune': bool(tune), 'threshold_tuning': bool(threshold_tuning), 'seed': seed, 'threshold_method': threshold_method, 'kernel': kernel, 'fixed_C': float(C), 'fixed_gamma': gamma, 'fixed_decision_threshold': float(decision_threshold), 'class_weight': 'balanced', 'cache_size': cache_size, 'n_jobs': n_jobs, 'versions': {'sklearn': sklearn.__version__, 'numpy': np.__version__, 'pandas': pd.__version__}, 'fallback_policy': 'best inner balanced accuracy when both targets cannot be met', 'n_features': len(names), 'input_files': config['input_files'], 'C_grid': C_grid if C_grid is not None else [0.1, 1.0, 10.0, 100.0], 'gamma_grid': gamma_grid if gamma_grid is not None else ['scale', 0.01, 0.1], 'min_sensitivity': min_sensitivity, 'min_specificity': min_specificity, 'threshold_grid': {'min': threshold_min, 'max': threshold_max, 'step': threshold_step, 'median_filter': int(median_filter) }}
+    settings = {'model_type': 'svm', 'model_name': 'SVM', 'score_units': 'SVM decision score', 'evaluation': 'loso', 'trainer_version': TRAINER_VERSION, 'outer_folds': len(outer_folds), 'inner_cv': 'SGKF' if needs_inner else None, 'inner_cv_folds': cv_folds if needs_inner else None, 'cv_levels': 2 if needs_inner else 1, 'tune': bool(tune), 'threshold_tuning': bool(threshold_tuning), 'seed': seed, 'threshold_method': threshold_method, 'kernel': kernel, 'fixed_C': float(C), 'fixed_gamma': gamma, 'fixed_decision_threshold': float(decision_threshold), 'class_weight': 'balanced', 'cache_size': cache_size, 'n_jobs': n_jobs, 'versions': {'sklearn': sklearn.__version__, 'numpy': np.__version__, 'pandas': pd.__version__}, 'fallback_policy': 'best inner balanced accuracy when both targets cannot be met', 'n_features': len(names), 'input_files': config['input_files'], 'C_grid': C_grid if C_grid is not None else [0.1, 1.0, 10.0, 100.0], 'gamma_grid': gamma_grid if gamma_grid is not None else ['scale', 0.01, 0.1], 'min_sensitivity': min_sensitivity, 'min_specificity': min_specificity, 'threshold_grid': {'min': threshold_min, 'max': threshold_max, 'step': threshold_step, 'median_filter': int(median_filter), 'cfs': bool(cfs), 'cfs_max_features': int(cfs_max_features) if cfs else None }}
     _write_json(output / 'run_settings.json', settings)
     _write_json(output / 'run_status.json', {'status': 'running', 'completed_subjects': []})
-    pipeline = Pipeline([('imputer', SimpleImputer(strategy='median', add_indicator=True, keep_empty_features=True)), ('scaler', StandardScaler()), ('svm', SVC(kernel=kernel, C=C, gamma=gamma, class_weight='balanced', probability=False, cache_size=cache_size))])
+    steps = [
+        ('imputer', SimpleImputer(strategy='median', add_indicator=True, keep_empty_features=True)),
+        ('scaler', StandardScaler()),
+    ]
+    if cfs:
+        steps.append(('cfs', CFSSelector(max_features=cfs_max_features)))
+    steps.append(('svm', SVC(kernel=kernel, C=C, gamma=gamma, class_weight='balanced', probability=False, cache_size=cache_size)))
+    pipeline = Pipeline(steps)
     subject_rows, predictions_all, fold_records, seen = ([], [], [], np.zeros(len(y), dtype=int))
     for fold, (train_idx, test_idx) in enumerate(outer_folds, 1):
         subject = str(groups[test_idx][0])
@@ -848,6 +1050,8 @@ def svm_main(argv=None):
     parser.add_argument('--no-save-models', action='store_true', help='LOSO only: omit per-fold joblib models')
     parser.add_argument('--save-all-sweeps', action='store_true', help='LOSO: save threshold sweeps for every parameter candidate (can be large)')
     parser.add_argument('--median-filter', type=_positive_odd_int, default=1, help='Cửa sổ lọc trung vị hậu xử lý theo Mazilu 2012 (1=tắt, 3, 5, 15, 31)')
+    parser.add_argument('--cfs', action='store_true', help='Bật chọn lọc đặc trưng CFS (Mazilu 2012) bên trong từng fold.')
+    parser.add_argument('--cfs-max-features', type=int, default=30, help='Số đặc trưng tối đa tìm kiếm trong CFS (mặc định: 30).')
     args = parser.parse_args(argv)
     try:
         if args.evaluation == 'loso':
