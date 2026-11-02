@@ -1,4 +1,6 @@
 from __future__ import annotations
+import csv
+import io
 import json
 import math
 import sys
@@ -14,20 +16,47 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QListWidget, QListWidgetItem, QPushButton, QLabel, QComboBox,
     QTabWidget, QTableWidget, QTableWidgetItem, QFileDialog,
-    QMessageBox, QCheckBox, QScrollArea, QAbstractItemView, QSpinBox,
+    QMessageBox, QCheckBox, QScrollArea, QAbstractItemView, QSpinBox, QHeaderView,
 )
 
-RATE_METRICS = ['sensitivity', 'specificity', 'ppv', 'npv', 'accuracy',
-                'fog_f1', 'balanced_accuracy', 'youden_index']
+RATE_METRICS = [
+    'sensitivity', 'specificity', 'geometric_mean', 'ppv', 'npv',
+    'accuracy', 'fog_f1', 'balanced_accuracy', 'youden_index',
+]
 COUNTS = ['TP', 'FP', 'FN', 'TN']
 LABELS = {
-    'sensitivity': 'Sensitivity / Recall', 'specificity': 'Specificity',
-    'ppv': 'Precision / PPV', 'npv': 'NPV', 'accuracy': 'Accuracy',
-    'fog_f1': 'FOG F1', 'balanced_accuracy': 'Balanced accuracy',
-    'youden_index': 'Youden index', 'TP': 'TP', 'FP': 'FP', 'FN': 'FN', 'TN': 'TN',
+    'sensitivity': 'Sensitivity / Recall',
+    'specificity': 'Specificity',
+    'geometric_mean': 'Geometric Mean (GM)',
+    'ppv': 'Precision / PPV',
+    'npv': 'NPV',
+    'accuracy': 'Accuracy',
+    'fog_f1': 'FOG F1',
+    'balanced_accuracy': 'Balanced accuracy',
+    'youden_index': 'Youden index',
+    'TP': 'TP', 'FP': 'FP', 'FN': 'FN', 'TN': 'TN',
 }
 COLORS = ['#2563eb', '#f97316', '#059669', '#9333ea',
           '#dc2626', '#0891b2', '#a16207', '#db2777']
+
+
+@dataclass
+class FoldInfo:
+    fold_name: str
+    subject: str
+    sensitivity: float | None
+    specificity: float | None
+    geometric_mean: float | None
+    balanced_accuracy: float | None
+    fog_f1: float | None
+    c_val: float | None
+    gamma_val: str | float | None
+    threshold: float | None
+    inner_gm_fold_mean: float | None
+    inner_gm_pooled: float | None
+    cfs_enabled: bool = False
+    cfs_features: list = field(default_factory=list)
+
 
 @dataclass
 class Run:
@@ -39,10 +68,13 @@ class Run:
     config: dict
     warnings: list = field(default_factory=list)
     shap_data: list = field(default_factory=list)
+    fold_infos: list = field(default_factory=list)
+    feature_names: list = field(default_factory=list)
 
     @property
     def n(self):
         return sum(self.values[k] for k in COUNTS)
+
 
 def metrics(counts):
     c = {}
@@ -52,16 +84,36 @@ def metrics(counts):
             raise ValueError(f'Số liệu {key} không hợp lệ: {value}')
         c[key] = int(value)
     tn, fp, fn, tp = (c[k] for k in ['TN', 'FP', 'FN', 'TP'])
+
     def div(a, b):
         return a / b if b else float('nan')
+
     sensitivity = div(tp, tp + fn)
     specificity = div(tn, tn + fp)
-    return dict(c, sensitivity=sensitivity, specificity=specificity,
-                ppv=div(tp, tp + fp), npv=div(tn, tn + fn),
-                accuracy=div(tp + tn, tp + tn + fp + fn),
-                fog_f1=div(2 * tp, 2 * tp + fp + fn),
-                balanced_accuracy=(sensitivity + specificity) / 2,
-                youden_index=sensitivity + specificity - 1)
+    gm = math.sqrt(sensitivity * specificity) if math.isfinite(sensitivity) and math.isfinite(specificity) else float('nan')
+    return dict(
+        c,
+        sensitivity=sensitivity,
+        specificity=specificity,
+        geometric_mean=gm,
+        ppv=div(tp, tp + fp),
+        npv=div(tn, tn + fn),
+        accuracy=div(tp + tn, tp + tn + fp + fn),
+        fog_f1=div(2 * tp, 2 * tp + fp + fn),
+        balanced_accuracy=(sensitivity + specificity) / 2,
+        youden_index=sensitivity + specificity - 1,
+    )
+
+
+def _safe_float(v):
+    if v is None or v == '':
+        return None
+    try:
+        f = float(v)
+        return f if math.isfinite(f) else None
+    except (ValueError, TypeError):
+        return None
+
 
 def load_runs(path):
     path = Path(path)
@@ -102,6 +154,7 @@ def load_runs(path):
                          and not any(p.startswith('fold_') for p in PurePosixPath(n).parts[:-1])]
         if not summaries:
             raise ValueError('Không tìm thấy loso_summary.json hoặc metrics.json ở gốc kết quả.')
+
         runs = []
         for name in sorted(summaries):
             parent = str(PurePosixPath(name).parent)
@@ -128,17 +181,59 @@ def load_runs(path):
             configs = [c for c in config.get('configurations', []) if isinstance(c, dict)]
             config = configs[0] if len(configs) == 1 else {'configurations': configs}
             title = PurePosixPath(parent).name if root else path.stem
+            feat_names = read_json(root + 'feature_names.json', []) or []
+
             shap_data = []
             for entry in sorted(n for n in names if n.startswith(root + 'fold_') and n.endswith('/shap/manifest.json')):
                 try:
-                    shap_data.append(read_shap_data(entry, read_json(entry), read_bytes, read_json(root + 'feature_names.json', [])))
+                    shap_data.append(read_shap_data(entry, read_json(entry), read_bytes, feat_names))
                 except (ValueError, OSError, KeyError, TypeError) as exc:
                     warnings.append('Không đọc SHAP ' + entry + ': ' + str(exc))
-            runs.append(Run(title, str(path.resolve()), root, values, settings, config, warnings, shap_data))
+
+            fold_infos = []
+            fold_metric_files = sorted(
+                n for n in names
+                if n.startswith(root + 'fold_') and PurePosixPath(n).name == 'metrics.json'
+                and len(PurePosixPath(n).relative_to(root if root else '.').parts) == 2
+            )
+            for fm_path in fold_metric_files:
+                fm = read_json(fm_path, {}) or {}
+                fold_dir = PurePosixPath(fm_path).parent.name
+                subj = str(fm.get('test_subject') or fold_dir.split('_')[-1])
+                sens = _safe_float(fm.get('sensitivity'))
+                spec = _safe_float(fm.get('specificity'))
+                gm_val = _safe_float(fm.get('geometric_mean'))
+                if gm_val is None and sens is not None and spec is not None:
+                    gm_val = math.sqrt(sens * spec)
+                bacc = _safe_float(fm.get('balanced_accuracy'))
+                if bacc is None and sens is not None and spec is not None:
+                    bacc = (sens + spec) / 2.0
+                sel_params = fm.get('selected_parameters') or {}
+                cfs_list = fm.get('cfs_selected_features')
+                cfs_enabled = bool(fm.get('cfs_enabled') or settings.get('cfs') or (isinstance(cfs_list, list) and len(cfs_list) > 0))
+                fold_infos.append(FoldInfo(
+                    fold_name=fold_dir,
+                    subject=subj,
+                    sensitivity=sens,
+                    specificity=spec,
+                    geometric_mean=gm_val,
+                    balanced_accuracy=bacc,
+                    fog_f1=_safe_float(fm.get('fog_f1')),
+                    c_val=_safe_float(sel_params.get('C')),
+                    gamma_val=sel_params.get('gamma'),
+                    threshold=_safe_float(fm.get('decision_threshold', sel_params.get('decision_threshold'))),
+                    inner_gm_fold_mean=_safe_float(sel_params.get('inner_gm_fold_mean')),
+                    inner_gm_pooled=_safe_float(sel_params.get('inner_gm_pooled')),
+                    cfs_enabled=cfs_enabled,
+                    cfs_features=list(cfs_list) if isinstance(cfs_list, list) else [],
+                ))
+
+            runs.append(Run(title, str(path.resolve()), root, values, settings, config, warnings, shap_data, fold_infos, feat_names))
         return runs
     finally:
         if archive:
             archive.close()
+
 
 @dataclass
 class ShapData:
@@ -153,9 +248,8 @@ class ShapData:
     weights: np.ndarray
     samples: list
 
+
 def read_shap_data(name, manifest, read_bytes, expected_names):
-    import io
-    import csv
     if manifest.get('schema') != 'fog-shap-v1' or manifest.get('status') != 'completed':
         raise ValueError('SHAP chưa hoàn tất hoặc schema không được hỗ trợ.')
     folder = name.rsplit('/', 1)[0] + '/'
@@ -189,23 +283,45 @@ def read_shap_data(name, manifest, read_bytes, expected_names):
         raise ValueError('Background SHAP lẫn người test.')
     for i, sample in enumerate(samples):
         y = int(sample['Binary_Label'])
+        raw_col = 'Raw_Prediction' if 'Raw_Prediction' in sample else 'Prediction'
+        p_raw = int(sample[raw_col])
         p = int(sample['Prediction'])
         outcome = 'TP' if y == 1 and p == 1 else 'FN' if y == 1 else 'FP' if p == 1 else 'TN'
-        if y not in (0, 1) or p not in (0, 1) or sample['Outcome'] != outcome or p != int(scores[i] > thresholds[i]) or int(sample['Dataset_Row']) != rows[i]:
+        if y not in (0, 1) or p not in (0, 1) or sample['Outcome'] != outcome or p_raw != int(scores[i] > thresholds[i]) or int(sample['Dataset_Row']) != rows[i]:
             raise ValueError('Metadata cửa sổ SHAP không khớp score.')
     return ShapData(manifest.get('fold', name), manifest, names, phi, values, scores, thresholds, base, weights, samples)
+
 
 def shap_indices(data, outcome='All'):
     return np.asarray([i for i, s in enumerate(data.samples) if outcome == 'All' or s['Outcome'] == outcome], int)
 
+
 def shap_importance(data, indices):
     return np.average(np.abs(data.phi[indices]), axis=0, weights=data.weights[indices])
+
 
 def shap_units(data):
     return data.manifest.get('score_units', 'SVM decision score')
 
+
 def model_label(run):
-    return run.settings.get('model_name') or ('Random Forest' if run.settings.get('model_type') == 'rf' else 'SVM')
+    base = run.settings.get('model_name') or ('Random Forest' if run.settings.get('model_type') == 'rf' else 'SVM')
+    extras = []
+    if run.settings.get('cfs'):
+        extras.append(f"CFS≤{run.settings.get('cfs_max_features', 30)}")
+    if run.settings.get('selection_metric'):
+        extras.append(str(run.settings.get('selection_metric')).upper())
+    med = run.settings.get('median_filter_window') or (run.settings.get('versions') or {}).get('median_filter')
+    if med and int(med) > 1:
+        extras.append(f'Med{int(med)}')
+    return base + (' [' + ', '.join(extras) + ']' if extras else '')
+
+
+def fig_base(title):
+    f = Figure(figsize=(12, 6), dpi=100, layout='constrained')
+    f.suptitle(title, fontsize=13, fontweight='bold', color='#183153')
+    return f
+
 
 def shap_bar(data, indices, k, sort_order='High → Low'):
     importance = shap_importance(data, indices)
@@ -227,6 +343,7 @@ def shap_bar(data, indices, k, sort_order='High → Low'):
     ax.grid(axis='x', alpha=0.2)
     ax.set_axisbelow(True)
     return f
+
 
 def shap_beeswarm(data, indices, k, sort_order='High → Low'):
     from matplotlib.colors import Normalize
@@ -263,6 +380,7 @@ def shap_beeswarm(data, indices, k, sort_order='High → Low'):
     cbar.set_ticks([0, 1], labels=['Low', 'High'])
     cbar.set_label('Feature value • scaled separately per feature')
     return f
+
 
 def shap_waterfall(data, index, k):
     phi = data.phi[index]
@@ -302,6 +420,7 @@ def shap_waterfall(data, index, k):
     ax.legend(fontsize=8, loc='upper left', bbox_to_anchor=(1.01, 1))
     return f
 
+
 def shap_stability(datasets, outcome, k, sort_order='High → Low'):
     valid = [(d, shap_indices(d, outcome)) for d in datasets]
     valid = [(d, i) for d, i in valid if len(i)]
@@ -331,10 +450,6 @@ def shap_stability(datasets, outcome, k, sort_order='High → Low'):
     ax.set_ylabel('Feature')
     return f
 
-def fig_base(title):
-    f = Figure(figsize=(12, 6), dpi=100, layout='constrained')
-    f.suptitle(title, fontsize=13, fontweight='bold', color='#183153')
-    return f
 
 def grouped_chart(runs, keys, title, percent=False, delta=False, baseline=None):
     f = fig_base(title)
@@ -363,6 +478,7 @@ def grouped_chart(runs, keys, title, percent=False, delta=False, baseline=None):
     ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1), fontsize=9)
     return f
 
+
 def confusion_chart(runs, normalize=False):
     f = fig_base('Confusion matrix • ' + ('row normalized (%)' if normalize else 'window counts'))
     cols = min(3, len(runs))
@@ -388,11 +504,105 @@ def confusion_chart(runs, normalize=False):
         ax.set_visible(False)
     return f
 
+
+def gm_subject_chart(runs):
+    subjects = sorted({fi.subject for r in runs for fi in r.fold_infos})
+    if not subjects:
+        return fig_base('Chưa có dữ liệu fold_xx/metrics.json để vẽ GM theo từng bệnh nhân')
+    f = fig_base('Outer-Test Geometric Mean (GM) theo từng bệnh nhân (%)')
+    ax = f.subplots()
+    n = max(len(runs), 1)
+    width = 0.8 / n
+    x = np.arange(len(subjects))
+    for i, r in enumerate(runs):
+        by_sub = {fi.subject: fi.geometric_mean for fi in r.fold_infos}
+        v = np.array([by_sub.get(s, np.nan) if by_sub.get(s) is not None else np.nan for s in subjects], float) * 100.0
+        bars = ax.bar(x - 0.4 + width / 2 + i * width, np.nan_to_num(v, nan=0.0), width, label=r.name, color=COLORS[i % len(COLORS)])
+        for bar, val in zip(bars, v):
+            if np.isfinite(val):
+                ax.annotate(f'{val:.1f}', (bar.get_x() + bar.get_width() / 2, val), xytext=(0, 3), textcoords='offset points', ha='center', fontsize=8)
+            else:
+                ax.annotate('N/A', (bar.get_x() + bar.get_width() / 2, 1.0), ha='center', fontsize=7, color='#64748b')
+    ax.set_xticks(x, subjects)
+    ax.set_ylabel('Geometric Mean (%)')
+    ax.set_ylim(0, 112)
+    ax.grid(axis='y', alpha=0.2)
+    ax.set_axisbelow(True)
+    ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1), fontsize=9)
+    return f
+
+
+def gm_inner_vs_outer_chart(run):
+    valid = [fi for fi in run.fold_infos if fi.inner_gm_fold_mean is not None or fi.geometric_mean is not None]
+    if not valid:
+        return fig_base(f'{run.name} • Chưa có thông tin GM trong các fold')
+    f = fig_base(f'{run.name} • Đối chứng Inner SGKF GM (Bước 4–5) và Outer Test GM (Bước 6)')
+    ax = f.subplots()
+    subjects = [fi.subject for fi in valid]
+    x = np.arange(len(subjects))
+    width = 0.26
+    inner_fold_gm = np.array([fi.inner_gm_fold_mean * 100 if fi.inner_gm_fold_mean is not None else np.nan for fi in valid], float)
+    inner_pool_gm = np.array([fi.inner_gm_pooled * 100 if fi.inner_gm_pooled is not None else np.nan for fi in valid], float)
+    outer_gm = np.array([fi.geometric_mean * 100 if fi.geometric_mean is not None else np.nan for fi in valid], float)
+
+    for offset, arr, label, color in [
+        (-width, inner_fold_gm, 'Inner GM (Fold-Mean • Bước 4)', '#2563eb'),
+        (0.0, inner_pool_gm, 'Inner GM (Pooled OOF)', '#f97316'),
+        (width, outer_gm, 'Outer Test GM (Bước 6)', '#059669'),
+    ]:
+        if np.isfinite(arr).any():
+            bars = ax.bar(x + offset, np.nan_to_num(arr, nan=0.0), width, label=label, color=color)
+            for bar, val in zip(bars, arr):
+                if np.isfinite(val):
+                    ax.annotate(f'{val:.1f}', (bar.get_x() + bar.get_width() / 2, val), xytext=(0, 3), textcoords='offset points', ha='center', fontsize=8)
+    ax.set_xticks(x, subjects)
+    ax.set_ylabel('Geometric Mean (%)')
+    ax.set_ylim(0, 115)
+    ax.grid(axis='y', alpha=0.2)
+    ax.set_axisbelow(True)
+    ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1), fontsize=9)
+    return f
+
+
+def cfs_frequency_chart(run, top_k=30, sort_order='High → Low'):
+    folds_with_cfs = [fi for fi in run.fold_infos if fi.cfs_features]
+    if not folds_with_cfs:
+        return fig_base(f'{run.name} • Chưa có danh sách cfs_selected_features (Hãy bật --cfs khi chạy train_fog.py)')
+    counts = {}
+    for fi in folds_with_cfs:
+        for feat in fi.cfs_features:
+            counts[feat] = counts.get(feat, 0) + 1
+    items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    if sort_order == 'Low → High':
+        items = list(reversed(items))
+    items = items[:top_k]
+    names = [k for k, _ in items]
+    vals = np.array([v for _, v in items], float)
+    pct = vals / len(folds_with_cfs) * 100.0
+    f = fig_base(f'{run.name} • Tần suất đặc trưng được CFS chọn qua {len(folds_with_cfs)} LOSO folds (Top {len(items)})')
+    f.set_size_inches(12, max(4.2, len(items) * 0.34 + 1.2))
+    ax = f.subplots()
+    y = np.arange(len(items))
+    bars = ax.barh(y, pct, color='#0891b2', height=0.68)
+    ax.set_yticks(y, names, fontsize=9)
+    ax.set_ylim(len(items) - 0.5, -0.5)
+    for bar, c_val, p_val in zip(bars, vals, pct):
+        ax.annotate(f'{int(c_val)}/{len(folds_with_cfs)} ({p_val:.0f}%)', (p_val, bar.get_y() + bar.get_height() / 2), xytext=(5, 0), textcoords='offset points', va='center', fontsize=9)
+    ax.set_xlim(0, 118)
+    ax.set_xlabel('Tỷ lệ xuất hiện trong tập đặc trưng tối ưu CFS (%)')
+    ax.set_ylabel('Feature (Sensor_Axis_Feature)')
+    ax.grid(axis='x', alpha=0.2)
+    ax.set_axisbelow(True)
+    return f
+
+
 class Loader(QThread):
     loaded = Signal(object, object)
+
     def __init__(self, paths):
         super().__init__()
         self.paths = paths
+
     def run(self):
         runs, errors = [], []
         for path in self.paths:
@@ -402,8 +612,10 @@ class Loader(QThread):
                 errors.append(f'{Path(path).name}: {exc}')
         self.loaded.emit(runs, errors)
 
+
 class ViewToolbar(NavigationToolbar2QT):
     toolitems = tuple(item for item in NavigationToolbar2QT.toolitems if item[0] != 'Save')
+
 
 class PlotPane(QWidget):
     def __init__(self):
@@ -435,22 +647,25 @@ class PlotPane(QWidget):
         canvas.draw()
         scroll.verticalScrollBar().setValue(0)
 
+
 class NumericItem(QTableWidgetItem):
     def __init__(self, text, number=None):
         super().__init__(text)
         self.number = number
+
     def __lt__(self, other):
         if isinstance(other, NumericItem) and self.number is not None and other.number is not None:
             return self.number < other.number
         return super().__lt__(other)
+
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.loading = False
         self.loader = None
-        self.setWindowTitle('FOG Compare')
-        self.resize(1365, 820)
+        self.setWindowTitle('FOG Compare — GM & CFS Edition')
+        self.resize(1420, 840)
         self.setAcceptDrops(True)
         root = QWidget()
         self.setCentralWidget(root)
@@ -491,12 +706,15 @@ class MainWindow(QMainWindow):
         content.addWidget(self.summary)
         self.tabs = QTabWidget()
         content.addWidget(self.tabs, 1)
+
         self.table = QTableWidget()
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.tabs.addTab(self.table, 'Bảng số liệu')
+
         self.metricsplot = PlotPane()
         self.tabs.addTab(self.metricsplot, 'Chỉ số')
+
         matrix = QWidget()
         matrixlayout = QVBoxLayout(matrix)
         self.normalize = QCheckBox('Hiển thị tỷ lệ theo nhãn thực tế (%)')
@@ -505,6 +723,7 @@ class MainWindow(QMainWindow):
         self.cmplot = PlotPane()
         matrixlayout.addWidget(self.cmplot)
         self.tabs.addTab(matrix, 'Confusion matrix')
+
         delta = QWidget()
         deltalayout = QVBoxLayout(delta)
         self.deltakind = QComboBox()
@@ -514,13 +733,106 @@ class MainWindow(QMainWindow):
         self.deltaplot = PlotPane()
         deltalayout.addWidget(self.deltaplot)
         self.tabs.addTab(delta, 'So với baseline')
+
         split.addWidget(right)
         split.setStretchFactor(1, 1)
-        self.setStyleSheet('QMainWindow{background:#f4f7fb} QPushButton{padding:8px;text-align:left} '
-                           'QTableWidget{background:white;gridline-color:#e2e8f0} '
-                           'QHeaderView::section{background:#e8eef7;padding:6px} QComboBox{padding:5px}')
+        self.setStyleSheet(
+            'QMainWindow{background:#f4f7fb} QPushButton{padding:8px;text-align:left} '
+            'QTableWidget{background:white;gridline-color:#e2e8f0} '
+            'QHeaderView::section{background:#e8eef7;padding:6px} QComboBox{padding:5px}'
+        )
+        self.create_gm_tab()
+        self.create_cfs_tab()
         self.create_shap_tab()
         self.refresh()
+
+    def create_gm_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        controls = QHBoxLayout()
+        self.gmmode = QComboBox()
+        self.gmmode.addItems([
+            '1. Tổng hợp Pooled GM vs Sensitivity & Specificity (%)',
+            '2. Outer-Test GM theo từng bệnh nhân (%)',
+            '3. Đối chứng Inner SGKF GM (Bước 4–5) vs Outer Test GM (Bước 6)',
+        ])
+        self.gmrun = QComboBox()
+        controls.addWidget(QLabel('Chế độ hiển thị GM:'))
+        controls.addWidget(self.gmmode, 2)
+        controls.addWidget(QLabel('Kết quả (cho chế độ 3):'))
+        controls.addWidget(self.gmrun, 1)
+        layout.addLayout(controls)
+
+        self.gmnote = QLabel()
+        self.gmnote.setWordWrap(True)
+        self.gmnote.setStyleSheet('color:#1e3a8a;padding:6px;background:#eff6ff;border-radius:4px')
+        layout.addWidget(self.gmnote)
+
+        splitter = QSplitter(Qt.Vertical)
+        self.gmplot = PlotPane()
+        splitter.addWidget(self.gmplot)
+        self.gmtable = QTableWidget()
+        self.gmtable.setAlternatingRowColors(True)
+        self.gmtable.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        splitter.addWidget(self.gmtable)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        layout.addWidget(splitter, 1)
+
+        self.tabs.addTab(page, 'Geometric Mean (GM)')
+        self.gmmode.currentIndexChanged.connect(self.draw_gm)
+        self.gmrun.currentIndexChanged.connect(self.draw_gm)
+
+    def create_cfs_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        controls = QHBoxLayout()
+        self.cfsrun = QComboBox()
+        self.cfsmode = QComboBox()
+        self.cfsmode.addItems([
+            'Tần suất đặc trưng được CFS chọn qua các LOSO folds',
+            'Danh sách đặc trưng CFS chi tiết theo từng fold / bệnh nhân',
+        ])
+        self.cfsfold = QComboBox()
+        self.cfstop = QSpinBox()
+        self.cfstop.setRange(1, 500)
+        self.cfstop.setValue(30)
+        self.cfssort = QComboBox()
+        self.cfssort.addItems(['High → Low', 'Low → High'])
+
+        for label, widget, stretch in [
+            ('Kết quả:', self.cfsrun, 1),
+            ('Chế độ:', self.cfsmode, 2),
+            ('Fold:', self.cfsfold, 1),
+            ('Top k:', self.cfstop, 0),
+            ('Sắp xếp:', self.cfssort, 0),
+        ]:
+            controls.addWidget(QLabel(label))
+            controls.addWidget(widget, stretch)
+        layout.addLayout(controls)
+
+        self.cfsnote = QLabel()
+        self.cfsnote.setWordWrap(True)
+        self.cfsnote.setStyleSheet('color:#065f46;padding:6px;background:#ecfdf5;border-radius:4px')
+        layout.addWidget(self.cfsnote)
+
+        splitter = QSplitter(Qt.Vertical)
+        self.cfsplot = PlotPane()
+        splitter.addWidget(self.cfsplot)
+        self.cfstable = QTableWidget()
+        self.cfstable.setAlternatingRowColors(True)
+        self.cfstable.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        splitter.addWidget(self.cfstable)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 2)
+        layout.addWidget(splitter, 1)
+
+        self.tabs.addTab(page, 'CFS Features')
+        self.cfsrun.currentIndexChanged.connect(self.cfs_run_changed)
+        self.cfsmode.currentIndexChanged.connect(self.draw_cfs)
+        self.cfsfold.currentIndexChanged.connect(self.draw_cfs)
+        self.cfstop.valueChanged.connect(self.draw_cfs)
+        self.cfssort.currentIndexChanged.connect(self.draw_cfs)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -602,6 +914,7 @@ class MainWindow(QMainWindow):
     def refresh(self, *_):
         runs = self.selected()
         self.refresh_shap_runs(runs)
+        self.refresh_gm_and_cfs_runs(runs)
         old = self.baseline.currentData()
         self.baseline.blockSignals(True)
         self.baseline.clear()
@@ -618,20 +931,20 @@ class MainWindow(QMainWindow):
                 pane.show_figure(fig_base('Chọn kết quả để xem'))
             return
         base = runs[max(0, self.baseline.currentIndex())]
-        notes = [f'{len(runs)} kết quả · Baseline: {base.name} · {base.n:,} cửa sổ']
+        notes = [f'{len(runs)} kết quả · Baseline: {base.name} · {base.n:,} cửa sổ · Pooled GM: {base.values["geometric_mean"] * 100:.2f}%']
         for run in runs:
             notes.extend(f'{run.name}: {warning}' for warning in run.warnings)
         if any(r.n != base.n for r in runs):
             notes.append('Số cửa sổ khác nhau: cần so sánh thêm các chỉ số tỷ lệ.')
         different = any(
             any(r.settings.get(k) != base.settings.get(k) for k in
-                ['model_type', 'evaluation', 'fixed_C', 'fixed_gamma', 'fixed_decision_threshold', 'tune', 'class_weight'])
+                ['model_type', 'evaluation', 'fixed_C', 'fixed_gamma', 'fixed_decision_threshold', 'tune', 'class_weight', 'cfs', 'selection_metric'])
             or any(r.config.get(k) != base.config.get(k) for k in
                    ['controls', 'selection', 'excluded_regions', 'label_mapping'])
             for r in runs
         )
         if different:
-            notes.append('Các kết quả có cấu hình train hoặc tiền xử lý khác nhau.')
+            notes.append('Các kết quả có cấu hình train (Weighted SVM / CFS / Selection Metric) hoặc tiền xử lý khác nhau.')
         self.summary.setText('\n'.join(notes))
         self.fill_table(runs, base)
         self.metricsplot.show_figure(grouped_chart(runs, RATE_METRICS, 'Chỉ số tổng hợp (%)', percent=True))
@@ -643,43 +956,251 @@ class MainWindow(QMainWindow):
 
     def fill_table(self, runs, base):
         columns = ['Run', 'Model', 'N_Windows', 'N_Features'] + COUNTS + RATE_METRICS + [
-            'Delta_FP', 'Delta_FN', 'Delta_sensitivity', 'FP_reduction_percent']
-        titles = {'Run': 'Kết quả', 'Model': 'Model', 'N_Windows': 'Cửa sổ', 'N_Features': 'Features',
-                  'Delta_FP': 'ΔFP', 'Delta_FN': 'ΔFN', 'Delta_sensitivity': 'ΔSensitivity (điểm %)',
-                  'FP_reduction_percent': 'Giảm FP (%)'}
+            'Delta_FP', 'Delta_FN', 'Delta_GM', 'Delta_sensitivity', 'FP_reduction_percent']
+        titles = {
+            'Run': 'Kết quả', 'Model': 'Model', 'N_Windows': 'Cửa sổ', 'N_Features': 'Features (Gốc → CFS)',
+            'Delta_FP': 'ΔFP', 'Delta_FN': 'ΔFN', 'Delta_GM': 'ΔGM (điểm %)',
+            'Delta_sensitivity': 'ΔSensitivity (điểm %)', 'FP_reduction_percent': 'Giảm FP (%)',
+        }
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(runs))
         self.table.setColumnCount(len(columns))
         self.table.setHorizontalHeaderLabels([
             titles.get(c, LABELS.get(c, c)) + (' (%)' if c in RATE_METRICS else '') for c in columns])
         for i, run in enumerate(runs):
-            row = dict(run.values, Run=run.name, Model=model_label(run), N_Windows=run.n, N_Features=run.settings.get('n_features'),
-                       Delta_FP=run.values['FP'] - base.values['FP'],
-                       Delta_FN=run.values['FN'] - base.values['FN'],
-                       Delta_sensitivity=run.values['sensitivity'] - base.values['sensitivity'],
-                       FP_reduction_percent=(base.values['FP'] - run.values['FP']) / base.values['FP'] * 100
-                       if base.values['FP'] else float('nan'))
+            n_feat_raw = run.settings.get('n_features') or len(run.feature_names)
+            cfs_counts = [len(fi.cfs_features) for fi in run.fold_infos if fi.cfs_features]
+            if cfs_counts:
+                mean_cfs = np.mean(cfs_counts)
+                feat_text = f'{n_feat_raw} → {mean_cfs:.1f}'
+            else:
+                feat_text = f'{n_feat_raw}' if n_feat_raw else 'N/A'
+            row = dict(
+                run.values,
+                Run=run.name,
+                Model=model_label(run),
+                N_Windows=run.n,
+                N_Features=feat_text,
+                Delta_FP=run.values['FP'] - base.values['FP'],
+                Delta_FN=run.values['FN'] - base.values['FN'],
+                Delta_GM=run.values['geometric_mean'] - base.values['geometric_mean'],
+                Delta_sensitivity=run.values['sensitivity'] - base.values['sensitivity'],
+                FP_reduction_percent=(base.values['FP'] - run.values['FP']) / base.values['FP'] * 100
+                if base.values['FP'] else float('nan'),
+            )
             for j, column in enumerate(columns):
                 value = row[column]
                 number = None
-                if column in ('Run', 'Model'):
-                    text = value
+                if column in ('Run', 'Model', 'N_Features'):
+                    text = str(value)
                 elif value is None or not math.isfinite(float(value)):
                     text = 'N/A'
                 else:
-                    number = float(value) * (100 if column in RATE_METRICS or column == 'Delta_sensitivity' else 1)
-                    if column in COUNTS + ['N_Windows', 'N_Features', 'Delta_FP', 'Delta_FN']:
+                    number = float(value) * (100 if column in RATE_METRICS or column in ('Delta_sensitivity', 'Delta_GM') else 1)
+                    if column in COUNTS + ['N_Windows', 'Delta_FP', 'Delta_FN']:
                         text = f'{number:+,.0f}' if column.startswith('Delta_') else f'{number:,.0f}'
                     else:
                         text = f'{number:+.2f}' if column.startswith('Delta_') else f'{number:.2f}'
                 item = NumericItem(text, number)
                 item.setTextAlignment(Qt.AlignLeft if column in ('Run', 'Model') else Qt.AlignRight | Qt.AlignVCenter)
-                if column in ['Delta_FP', 'Delta_FN', 'Delta_sensitivity'] and number:
+                if column in ['Delta_FP', 'Delta_FN', 'Delta_GM', 'Delta_sensitivity'] and number:
                     good = number < 0 if column in ['Delta_FP', 'Delta_FN'] else number > 0
                     item.setForeground(QColor('#047857' if good else '#b91c1c'))
                 self.table.setItem(i, j, item)
         self.table.resizeColumnsToContents()
         self.table.setSortingEnabled(True)
+
+    def refresh_gm_and_cfs_runs(self, runs):
+        self._active_runs = runs
+        for combo in (self.gmrun, self.cfsrun):
+            old = combo.currentData()
+            combo.blockSignals(True)
+            combo.clear()
+            for r in runs:
+                combo.addItem(r.name, r.source + '::' + r.root)
+            idx = combo.findData(old)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            combo.blockSignals(False)
+        self.draw_gm()
+        self.cfs_run_changed()
+
+    def draw_gm(self, *_):
+        runs = getattr(self, '_active_runs', [])
+        if not runs:
+            self.gmnote.setText('Thêm kết quả train để đối chứng Geometric Mean (GM = sqrt(Sensitivity × Specificity)).')
+            self.gmplot.show_figure(fig_base('Chưa có dữ liệu GM'))
+            self.gmtable.setRowCount(0)
+            return
+
+        mode = self.gmmode.currentIndex()
+        self.gmrun.setEnabled(mode == 2)
+        if mode == 0:
+            self.gmnote.setText(
+                'Chế độ 1: Đối chứng Pooled Geometric Mean (GM), Sensitivity, Specificity và Balanced Accuracy giữa các mô hình '
+                '(ví dụ Weighted SVM class_weight=balanced theo Ahlrichs 2016 vs Standard SVM).'
+            )
+            self.gmplot.show_figure(grouped_chart(
+                runs,
+                ['geometric_mean', 'sensitivity', 'specificity', 'balanced_accuracy', 'fog_f1'],
+                'Geometric Mean (GM) & Các chỉ số liên quan (%)',
+                percent=True,
+            ))
+        elif mode == 1:
+            self.gmnote.setText(
+                'Chế độ 2: Geometric Mean (GM) tính riêng trên từng bệnh nhân Outer Test (Bước 6). '
+                'Bệnh nhân không có mẫu FOG thực tế (TP+FN=0) sẽ hiển thị N/A.'
+            )
+            self.gmplot.show_figure(gm_subject_chart(runs))
+        else:
+            idx = max(0, self.gmrun.currentIndex())
+            run = runs[idx]
+            self.gmnote.setText(
+                f'Chế độ 3 ({run.name}): Đối chứng giữa Inner SGKF GM_Fold_Mean (Bước 3–4: trung bình Sens & Spec qua các inner folds), '
+                'Inner GM_Pooled và kết quả Outer Test GM (Bước 6) cùng cặp siêu tham số (C, gamma) được chọn ở Bước 5.'
+            )
+            self.gmplot.show_figure(gm_inner_vs_outer_chart(run))
+
+        rows = []
+        for r in runs:
+            valid_gms = [fi.geometric_mean for fi in r.fold_infos if fi.geometric_mean is not None]
+            macro_gm = float(np.mean(valid_gms)) if valid_gms else None
+            for fi in r.fold_infos:
+                rows.append((
+                    r.name,
+                    fi.subject,
+                    r.settings.get('class_weight', 'balanced'),
+                    r.settings.get('selection_metric', 'gm'),
+                    fi.c_val,
+                    fi.gamma_val,
+                    fi.inner_gm_fold_mean,
+                    fi.inner_gm_pooled,
+                    fi.sensitivity,
+                    fi.specificity,
+                    fi.geometric_mean,
+                    macro_gm,
+                    r.values.get('geometric_mean'),
+                ))
+        headers = [
+            'Kết quả', 'Subject', 'Class Weight', 'Selection Metric', 'Selected C', 'Selected Gamma',
+            'Inner GM (Fold-Mean %)', 'Inner GM (Pooled %)', 'Outer Sens (%)', 'Outer Spec (%)',
+            'Outer Subject GM (%)', 'Macro Mean GM (%)', 'Pooled Run GM (%)',
+        ]
+        self.gmtable.setSortingEnabled(False)
+        self.gmtable.setRowCount(len(rows))
+        self.gmtable.setColumnCount(len(headers))
+        self.gmtable.setHorizontalHeaderLabels(headers)
+        for i, row in enumerate(rows):
+            for j, val in enumerate(row):
+                if j < 4 or j == 5:
+                    text = 'N/A' if val is None else str(val)
+                    item = NumericItem(text)
+                elif j == 4:
+                    num = _safe_float(val)
+                    item = NumericItem(f'{num:g}' if num is not None else 'N/A', num)
+                else:
+                    num = _safe_float(val)
+                    pct = num * 100.0 if num is not None else None
+                    item = NumericItem(f'{pct:.2f}' if pct is not None else 'N/A', pct)
+                item.setTextAlignment(Qt.AlignLeft if j < 4 else Qt.AlignRight | Qt.AlignVCenter)
+                self.gmtable.setItem(i, j, item)
+        self.gmtable.resizeColumnsToContents()
+        self.gmtable.setSortingEnabled(True)
+
+    def cfs_run_changed(self, *_):
+        runs = getattr(self, '_active_runs', [])
+        idx = self.cfsrun.currentIndex()
+        run = runs[idx] if 0 <= idx < len(runs) else None
+        self.cfsfold.blockSignals(True)
+        self.cfsfold.clear()
+        if run:
+            for fi in run.fold_infos:
+                self.cfsfold.addItem(f'{fi.fold_name} ({len(fi.cfs_features)} features)', fi.fold_name)
+        self.cfsfold.blockSignals(False)
+        self.draw_cfs()
+
+    def draw_cfs(self, *_):
+        runs = getattr(self, '_active_runs', [])
+        idx = self.cfsrun.currentIndex()
+        run = runs[idx] if 0 <= idx < len(runs) else None
+        mode = self.cfsmode.currentIndex()
+        self.cfsfold.setEnabled(mode == 1)
+        self.cfstop.setEnabled(mode == 0)
+        self.cfssort.setEnabled(mode == 0)
+
+        if run is None:
+            self.cfsnote.setText('Thêm kết quả train có bật --cfs (hoặc tích chọn CFS trên GUI) để xem danh sách đặc trưng được chọn.')
+            self.cfsplot.show_figure(fig_base('Chưa có dữ liệu CFS'))
+            self.cfstable.setRowCount(0)
+            return
+
+        folds_with_cfs = [fi for fi in run.fold_infos if fi.cfs_features]
+        total_raw = run.settings.get('n_features') or len(run.feature_names)
+        if not folds_with_cfs:
+            self.cfsnote.setText(
+                f'{run.name}: Lượt train này không bật CFS hoặc chưa lưu cfs_selected_features trong fold_xx/metrics.json '
+                f'(Tổng số đặc trưng đầu vào: {total_raw}).'
+            )
+            self.cfsplot.show_figure(fig_base(f'{run.name} • Chưa bật bộ lọc CFS'))
+            self.cfstable.setRowCount(0)
+            return
+
+        counts = {}
+        fold_map = {}
+        for fi in folds_with_cfs:
+            for feat in fi.cfs_features:
+                counts[feat] = counts.get(feat, 0) + 1
+                fold_map.setdefault(feat, []).append(fi.subject)
+
+        mean_selected = np.mean([len(fi.cfs_features) for fi in folds_with_cfs])
+        self.cfsnote.setText(
+            f'{run.name} • CFS (Mazilu 2012 / Hall 1999): Giảm chiều từ {total_raw} đặc trưng gốc xuống trung bình '
+            f'{mean_selected:.1f} đặc trưng/fold (tối đa cấu hình: {run.settings.get("cfs_max_features", "?")}) '
+            f'trên {len(folds_with_cfs)} LOSO folds. Tổng số đặc trưng khác nhau xuất hiện ít nhất 1 fold: {len(counts)}.'
+        )
+        self.cfsplot.show_figure(cfs_frequency_chart(run, self.cfstop.value(), self.cfssort.currentText()))
+
+        self.cfstable.setSortingEnabled(False)
+        if mode == 0:
+            items = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+            headers = ['Hạng', 'Tên đặc trưng (Feature)', 'Số fold được chọn', 'Tỷ lệ xuất hiện (%)', 'Các fold (Subject) đã chọn']
+            self.cfstable.setRowCount(len(items))
+            self.cfstable.setColumnCount(len(headers))
+            self.cfstable.setHorizontalHeaderLabels(headers)
+            for row_idx, (feat, cnt) in enumerate(items):
+                pct = cnt / len(folds_with_cfs) * 100.0
+                subjects_str = ', '.join(fold_map.get(feat, []))
+                row_items = [
+                    NumericItem(str(row_idx + 1), row_idx + 1),
+                    NumericItem(feat),
+                    NumericItem(f'{cnt}/{len(folds_with_cfs)}', cnt),
+                    NumericItem(f'{pct:.1f}%', pct),
+                    NumericItem(subjects_str),
+                ]
+                for col_idx, it in enumerate(row_items):
+                    it.setTextAlignment(Qt.AlignLeft if col_idx in (1, 4) else Qt.AlignRight | Qt.AlignVCenter)
+                    self.cfstable.setItem(row_idx, col_idx, it)
+        else:
+            f_idx = max(0, self.cfsfold.currentIndex())
+            fi = run.fold_infos[f_idx] if f_idx < len(run.fold_infos) else folds_with_cfs[0]
+            headers = ['STT trong Fold', 'Fold / Test Subject', 'Tên đặc trưng được CFS chọn', 'Tần suất chung toàn LOSO']
+            self.cfstable.setRowCount(len(fi.cfs_features))
+            self.cfstable.setColumnCount(len(headers))
+            self.cfstable.setHorizontalHeaderLabels(headers)
+            for row_idx, feat in enumerate(fi.cfs_features):
+                cnt = counts.get(feat, 1)
+                pct = cnt / len(folds_with_cfs) * 100.0
+                row_items = [
+                    NumericItem(str(row_idx + 1), row_idx + 1),
+                    NumericItem(f'{fi.fold_name} ({fi.subject})'),
+                    NumericItem(feat),
+                    NumericItem(f'{cnt}/{len(folds_with_cfs)} ({pct:.1f}%)', pct),
+                ]
+                for col_idx, it in enumerate(row_items):
+                    it.setTextAlignment(Qt.AlignLeft if col_idx in (1, 2) else Qt.AlignRight | Qt.AlignVCenter)
+                    self.cfstable.setItem(row_idx, col_idx, it)
+        self.cfstable.resizeColumnsToContents()
+        self.cfstable.setSortingEnabled(True)
 
     def create_shap_tab(self):
         page = QWidget()
@@ -788,8 +1309,7 @@ class MainWindow(QMainWindow):
             f"{manifest.get('explainer', 'KernelExplainer')} · {shap_units(data)} · Lọc {len(indices)}/{len(data.samples)} mẫu SHAP; "
             f"outer test có {manifest.get('n_test_windows', '?')} cửa sổ · background {manifest.get('n_background', '?')} mẫu train · "
             f"sampling={manifest.get('sampling', '?')} · nsamples={manifest.get('nsamples', '?')} · l1_reg={manifest.get('l1_reg', '?')}. "
-            'SHAP trên outer-test; thanh dài không có nghĩa feature tốt, SHAP=0 không chứng minh nhiễu. Không so trực tiếp độ lớn SHAP xác suất RF với decision score SVM. '
-            'Beeswarm phản ánh mẫu đã chọn, không có trọng số trên vị trí điểm.'
+            'SHAP trên outer-test; thanh dài không có nghĩa feature tốt, SHAP=0 không chứng minh nhiễu. Không so trực tiếp độ lớn SHAP xác suất RF với decision score SVM.'
         )
         try:
             if mode == 3:
@@ -852,6 +1372,7 @@ class MainWindow(QMainWindow):
         else:
             event.accept()
 
+
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
@@ -861,6 +1382,7 @@ def main():
     if paths:
         QTimer.singleShot(100, lambda: window.load(paths))
     sys.exit(app.exec())
+
 
 if __name__ == '__main__':
     main()
