@@ -190,7 +190,6 @@ def window_extra(signals,fs,config,channel_values):
         for a,b in pairs(config):
             u=mags[a];v=mags[b]; lim=min(int(o['crosscorr_max_s']*fs),len(u)//2)
             ks=np.arange(-lim,lim+1);vals=[]
-            # Positive lag pairs a[n] with b[n+k]. At least half a window overlaps.
             for k in ks:
                 uu,vv=(u[:len(u)-k],v[k:]) if k>=0 else (u[-k:],v[:len(v)+k])
                 vals.append(corr(uu,vv))
