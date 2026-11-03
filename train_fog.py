@@ -26,6 +26,7 @@ AXES = ['Forward', 'Vertical', 'Lateral']
 ALIASES = {'subject_id': 'Subject_ID', 'Subject': 'Subject_ID', 'recording_id': 'Recording_ID', 'Recording': 'Recording_ID', 'segment_id': 'Segment_ID', 'window_id': 'Window_ID', 'window_start': 'Start_Time', 'window_end': 'End_Time', 'fog_ratio': 'FOG_Ratio', 'config_id': 'Config_ID', 'y': 'Binary_Label'}
 META = ['Subject_ID', 'Recording_ID', 'Segment_ID', 'Window_ID', 'Start_Time', 'End_Time']
 
+
 def discover_inputs(inputs):
     result = []
     for item in inputs:
@@ -302,7 +303,9 @@ def _split(data, test_size, seed, test_subjects):
             raise ValueError(f'Tập {label} thiếu một lớp. Chỉ định --test-subjects theo thiết kế thí nghiệm; chương trình không tự thử seed đến khi đạt kết quả tốt.')
     return (train_idx, test_idx)
 
-from scipy.signal import medfilt
+
+from scipy.ndimage import median_filter as nd_median_filter
+
 
 def _positive_odd_int(value):
     try:
@@ -314,25 +317,49 @@ def _positive_odd_int(value):
     return k
 
 
+def _ordered_segment_slices(manifest_df):
+    if manifest_df is None or len(manifest_df) == 0:
+        return []
+    work = manifest_df[['Subject_ID', 'Recording_ID', 'Segment_ID', 'Window_ID']].copy()
+    work['_idx'] = np.arange(len(work))
+    slices = []
+    for _, group in work.groupby(['Subject_ID', 'Recording_ID', 'Segment_ID'], sort=False):
+        ordered = group.sort_values('Window_ID', kind='stable')
+        idx = ordered['_idx'].to_numpy(dtype=int)
+        if len(idx) >= 3:
+            slices.append(idx)
+    return slices
+
+
 def apply_median_postprocessing(manifest_df, raw_predictions, kernel_size=1):
     raw = np.asarray(raw_predictions, dtype=np.int8)
-    if kernel_size is None or int(kernel_size) <= 1:
+    if kernel_size is None or int(kernel_size) <= 1 or manifest_df is None:
         return raw.copy()
     kernel_size = int(kernel_size)
     if kernel_size < 1 or kernel_size % 2 == 0:
         raise ValueError('Kích thước median_filter phải là số nguyên lẻ >= 1.')
     smoothed = raw.copy()
-    work = manifest_df[['Subject_ID', 'Recording_ID', 'Segment_ID', 'Window_ID']].copy()
-    work['_idx'] = np.arange(len(work))
-    for _, group in work.groupby(['Subject_ID', 'Recording_ID', 'Segment_ID'], sort=False):
-        ordered = group.sort_values('Window_ID', kind='stable')
-        idx = ordered['_idx'].to_numpy()
+    for idx in _ordered_segment_slices(manifest_df):
         n = len(idx)
-        if n >= 3:
-            k = min(kernel_size, n if n % 2 == 1 else n - 1)
-            if k >= 3:
-                smoothed[idx] = medfilt(smoothed[idx].astype(float), kernel_size=k).astype(np.int8)
+        k = min(kernel_size, n if n % 2 == 1 else n - 1)
+        if k >= 3:
+            smoothed[idx] = nd_median_filter(smoothed[idx], size=k, mode='nearest').astype(np.int8)
     return smoothed
+
+
+def _apply_median_matrix(manifest_df, raw_matrix, kernel_size=1):
+    """Vectorized 2D nearest-boundary median filter cho bảng quét ngưỡng (N_windows x N_thresholds)."""
+    if kernel_size is None or int(kernel_size) <= 1 or manifest_df is None:
+        return raw_matrix
+    kernel_size = int(kernel_size)
+    smoothed = raw_matrix.copy()
+    for idx in _ordered_segment_slices(manifest_df):
+        n = len(idx)
+        k = min(kernel_size, n if n % 2 == 1 else n - 1)
+        if k >= 3:
+            smoothed[idx, :] = nd_median_filter(smoothed[idx, :], size=(k, 1), mode='nearest')
+    return smoothed
+
 
 class CFSSelector(BaseEstimator, TransformerMixin):
     """Correlation-based Feature Subset Selection (Hall 1999 / Mazilu 2012)."""
@@ -418,20 +445,31 @@ class CFSSelector(BaseEstimator, TransformerMixin):
     def transform(self, X):
         X = np.asarray(X, dtype=float)
         return X[:, self.support_mask_]
-    
+
+
 def _resolve_cfs_from_config(config_meta, cli_cfs, cli_max_features):
-    """Tự động bật CFS nếu người dùng đã tích chọn trên GUI (lưu trong config_json) hoặc truyền cờ --cfs."""
+    """Tự động bật CFS nếu người dùng đã tích chọn trên GUI (lưu trong config_json) hoặc truyền cờ --cfs.
+    Ưu tiên số lượng đặc trưng tối đa: CLI (nếu truyền tường minh) > GUI (config_json, vd: 55) > Mặc định (30).
+    """
     cfg_cfs = False
     cfg_max = None
     for c in (config_meta or {}).get('configurations', []):
         if isinstance(c, dict):
             fo = c.get('feature_options', {})
-            if isinstance(fo, dict) and fo.get('cfs'):
-                cfg_cfs = True
-                cfg_max = fo.get('cfs_max_features', 30)
+            if isinstance(fo, dict):
+                if fo.get('cfs'):
+                    cfg_cfs = True
+                if fo.get('cfs_max_features') is not None:
+                    cfg_max = int(fo['cfs_max_features'])
     use_cfs = bool(cli_cfs or cfg_cfs)
-    max_feat = int(cli_max_features if cli_cfs or cfg_max is None else cfg_max)
+    if cli_max_features is not None:
+        max_feat = int(cli_max_features)
+    elif cfg_max is not None:
+        max_feat = int(cfg_max)
+    else:
+        max_feat = 30
     return use_cfs, max_feat
+
 
 def diagnostic_metrics(y_true, y_pred):
     truth = np.asarray(y_true)
@@ -511,8 +549,8 @@ def patient_validation_scores(pipeline, X, y, groups, *, cv_folds=3, seed=42, tu
         raise ValueError('Có cửa sổ chưa nhận score validation hợp lệ.')
     return (scores, fold_ids, pd.DataFrame(records))
 
-def sweep_validation_thresholds(y, scores, *, min_sensitivity=0.85, min_specificity=0.85, method='grid', threshold_min=-1.5, threshold_max=0.5, threshold_step=0.02):
-    y = np.asarray(y)
+def sweep_validation_thresholds(y, scores, *, min_sensitivity=0.85, min_specificity=0.85, method='grid', threshold_min=-0.15, threshold_max=0.5, threshold_step=0.02, manifest_subset=None, median_filter=1):
+    y = np.asarray(y, dtype=np.int8)
     scores = np.asarray(scores, dtype=float)
     if scores.shape != y.shape or not np.isfinite(scores).all():
         raise ValueError('Scores validation không hợp lệ.')
@@ -535,20 +573,31 @@ def sweep_validation_thresholds(y, scores, *, min_sensitivity=0.85, min_specific
         thresholds = np.unique(np.r_[threshold_min + np.arange(count + 1) * threshold_step, threshold_max])
     else:
         raise ValueError('Threshold method cần grid hoặc exact.')
-    order = np.argsort(scores)
-    sorted_scores, sorted_y = (scores[order], y[order])
-    prefix_positive = np.r_[0, np.cumsum(sorted_y == 1)]
-    cut = np.searchsorted(sorted_scores, thresholds, side='right')
-    fn = prefix_positive[cut]
-    tn = cut - fn
+
     positives = int(np.sum(y == 1))
     negatives = len(y) - positives
-    tp = positives - fn
-    fp = negatives - tn
+    if manifest_subset is not None and median_filter is not None and int(median_filter) > 1:
+        raw_mat = (scores[:, None] > thresholds[None, :]).astype(np.int8)
+        pred_mat = _apply_median_matrix(manifest_subset, raw_mat, int(median_filter))
+        y_col = y[:, None]
+        tp = np.sum((pred_mat == 1) & (y_col == 1), axis=0, dtype=int)
+        fp = np.sum((pred_mat == 1) & (y_col == 0), axis=0, dtype=int)
+        fn = positives - tp
+        tn = negatives - fp
+    else:
+        order = np.argsort(scores)
+        sorted_scores, sorted_y = (scores[order], y[order])
+        prefix_positive = np.r_[0, np.cumsum(sorted_y == 1)]
+        cut = np.searchsorted(sorted_scores, thresholds, side='right')
+        fn = prefix_positive[cut]
+        tn = cut - fn
+        tp = positives - fn
+        fp = negatives - tn
+
     sens, spec = (tp / positives, tn / negatives)
     ppv = np.divide(tp, tp + fp, out=np.full(len(tp), np.nan), where=tp + fp != 0)
     npv = np.divide(tn, tn + fn, out=np.full(len(tp), np.nan), where=tn + fn != 0)
-    f1 = 2 * tp / (2 * tp + fp + fn)
+    f1 = np.divide(2 * tp, 2 * tp + fp + fn, out=np.zeros(len(tp), dtype=float), where=(2 * tp + fp + fn) != 0)
     gm = np.sqrt(sens * spec)
     table = pd.DataFrame({
         'Decision_Threshold': thresholds, 'Sensitivity': sens, 'Specificity': spec,
@@ -560,7 +609,7 @@ def sweep_validation_thresholds(y, scores, *, min_sensitivity=0.85, min_specific
     eligible = table[table.Meets_Target]
     selected = None
     if not eligible.empty:
-        selected = float(eligible.sort_values(['Sensitivity', 'Specificity', 'Decision_Threshold'], ascending=[False, False, False]).iloc[0].Decision_Threshold)
+        selected = float(eligible.sort_values(['Geometric_Mean', 'Sensitivity', 'Specificity', 'Decision_Threshold'], ascending=[False, False, False, False]).iloc[0].Decision_Threshold)
     return (table, selected)
 
 def _patient_metrics(y, scores, groups, threshold, manifest_subset=None, median_filter=1):
@@ -580,6 +629,7 @@ def _patient_metrics(y, scores, groups, threshold, manifest_subset=None, median_
             'N_FOG': int(np.sum(truth == 1)),
             'Sensitivity': result['sensitivity'],
             'Specificity': result['specificity'],
+            'Geometric_Mean': result['geometric_mean'],
             'Accuracy': result['accuracy'],
             'PPV': result['ppv'],
             'NPV': result['npv'],
@@ -604,36 +654,40 @@ def _manifest(data, train_idx, test_idx):
     split[test_idx] = 'test'
     return pd.DataFrame({'Subject_ID': data['subject_id'], 'Recording_ID': data['recording_id'], 'Segment_ID': data['segment_id'], 'Window_ID': data['window_id'], 'Start_Time': data['window_start'], 'End_Time': data['window_end'], 'Binary_Label': data['y'], 'Source_File': data['source_file'], 'Split': split})
 
-def _save_validation(output, manifest, train_idx, y, groups, scores, fold_ids, folds, sweep, selected, targets, nested):
+def _save_validation(output, manifest, train_idx, y, groups, scores, fold_ids, folds, sweep, selected, targets, nested, median_filter=1):
     target_met = selected is not None
-    diagnostic = float(sweep.sort_values(['Balanced_Accuracy', 'F1_FOG', 'Decision_Threshold'], ascending=[False, False, False]).iloc[0].Decision_Threshold)
+    diagnostic = float(sweep.sort_values(['Geometric_Mean', 'Balanced_Accuracy', 'F1_FOG', 'Decision_Threshold'], ascending=[False, False, False, False]).iloc[0].Decision_Threshold)
     reporting = float(selected) if target_met else diagnostic
     role = 'selected_on_validation' if target_met else 'diagnostic_only_target_unmet'
-    predictions = (scores > reporting).astype(np.int8)
+    raw_predictions = (scores > reporting).astype(np.int8)
+    train_manifest = manifest.iloc[train_idx].copy()
+    predictions = apply_median_postprocessing(train_manifest, raw_predictions, median_filter)
     sweep.to_csv(output / 'validation_threshold_sweep.csv', index=False)
     folds.to_csv(output / 'validation_folds.csv', index=False)
-    windows = manifest.iloc[train_idx].copy()
+    windows = train_manifest.copy()
     windows['Split'] = 'validation_oof'
     windows['Validation_Fold'] = fold_ids
     windows['FOG_Decision_Score'] = scores
+    windows['Raw_Prediction'] = raw_predictions
     windows['Prediction'] = predictions
+    windows['Median_Filter_Window'] = int(median_filter)
     windows['Decision_Threshold'] = reporting
     windows['Threshold_Role'] = role
     windows.to_csv(output / 'validation_scores.csv', index=False)
-    patients = _patient_metrics(y, scores, groups, reporting)
+    patients = _patient_metrics(y, scores, groups, reporting, manifest_subset=train_manifest, median_filter=median_filter)
     patients['Threshold_Role'] = role
     patients.to_csv(output / 'validation_patient_metrics.csv', index=False)
     fold_metrics = []
     for fold in np.unique(fold_ids):
         mask = fold_ids == fold
         result = diagnostic_metrics(y[mask], predictions[mask])
-        fold_metrics.append({'Fold': int(fold), 'Decision_Threshold': reporting, 'Threshold_Role': role, **{k: result[k] for k in ('sensitivity', 'specificity', 'accuracy')}, **result['confusion_counts']})
+        fold_metrics.append({'Fold': int(fold), 'Decision_Threshold': reporting, 'Threshold_Role': role, **{k: result[k] for k in ('sensitivity', 'specificity', 'geometric_mean', 'accuracy')}, **result['confusion_counts']})
     pd.DataFrame(fold_metrics).to_csv(output / 'validation_fold_metrics.csv', index=False)
-    summary = {'status': 'target_met' if target_met else 'target_not_met', 'target_met': target_met, 'selected_threshold': selected, 'diagnostic_candidate_threshold': diagnostic, 'reporting_threshold': reporting, 'reporting_threshold_role': role, 'targets': targets, 'nested_hyperparameter_tuning': bool(nested), 'selection_rule': 'max sensitivity subject to both targets; ties: specificity, threshold', 'evaluation_unit': 'window; pooled OOF counts, not mean patient sensitivity', 'n_validation_windows': len(y), 'subjects': np.unique(groups).tolist(), 'reporting_metrics': diagnostic_metrics(y, predictions), 'notes': ['Validation scores select a threshold; they are not an independent final performance estimate.', 'Each outer fold fits its own scaler and SVM; refitting can change score scale.', 'Only thresholds in the exported sweep were considered.']}
+    summary = {'status': 'target_met' if target_met else 'target_not_met', 'target_met': target_met, 'selected_threshold': selected, 'diagnostic_candidate_threshold': diagnostic, 'reporting_threshold': reporting, 'reporting_threshold_role': role, 'targets': targets, 'nested_hyperparameter_tuning': bool(nested), 'selection_rule': 'max geometric mean subject to both targets; ties: sensitivity, specificity, threshold', 'evaluation_unit': 'window; pooled OOF counts after nearest-boundary median filtering', 'n_validation_windows': len(y), 'subjects': np.unique(groups).tolist(), 'reporting_metrics': diagnostic_metrics(y, predictions), 'notes': ['Validation scores select a threshold; they are not an independent final performance estimate.', 'Each outer fold fits its own scaler and SVM; refitting can change score scale.', 'Only thresholds in the exported sweep were considered.']}
     _write_json(output / 'validation_metrics.json', summary)
     return summary
 
-def train(paths, output, test_size=0.25, seed=42, *, kernel='rbf', C=1.0, gamma='scale', tune=False, cv_folds=3, test_subjects=None, n_jobs=1, cache_size=512.0, decision_threshold=0.0, threshold_tuning=False, min_sensitivity=0.85, min_specificity=0.85, threshold_method='grid', threshold_min=-1.5, threshold_max=0.5, threshold_step=0.02, inner_cv_folds=3, median_filter=1, cfs=False, cfs_max_features=30, class_weight='balanced', fog_weight_ratio=None):
+def train(paths, output, test_size=0.25, seed=42, *, kernel='rbf', C=1.0, gamma='scale', tune=False, cv_folds=3, test_subjects=None, n_jobs=1, cache_size=512.0, decision_threshold=0.0, threshold_tuning=False, min_sensitivity=0.85, min_specificity=0.85, threshold_method='grid', threshold_min=-0.15, threshold_max=0.5, threshold_step=0.02, inner_cv_folds=3, median_filter=1, cfs=False, cfs_max_features=None, class_weight='balanced', fog_weight_ratio=None):
     if kernel not in ('rbf', 'linear') or not np.isfinite(C) or C <= 0 or (not np.isfinite(cache_size)) or (cache_size <= 0):
         raise ValueError('Kernel phải là rbf/linear; C và cache-size phải >0.')
     if isinstance(gamma, (float, int)):
@@ -676,9 +730,9 @@ def train(paths, output, test_size=0.25, seed=42, *, kernel='rbf', C=1.0, gamma=
     validation_summary = None
     if threshold_tuning:
         val_scores, val_folds, fold_table = patient_validation_scores(pipeline, X_train, y_train, train_groups, cv_folds=cv_folds, seed=seed, tune=tune, inner_cv_folds=inner_cv_folds, kernel=kernel, n_jobs=n_jobs)
-        sweep, selected = sweep_validation_thresholds(y_train, val_scores, min_sensitivity=min_sensitivity, min_specificity=min_specificity, method=threshold_method, threshold_min=threshold_min, threshold_max=threshold_max, threshold_step=threshold_step)
+        sweep, selected = sweep_validation_thresholds(y_train, val_scores, min_sensitivity=min_sensitivity, min_specificity=min_specificity, method=threshold_method, threshold_min=threshold_min, threshold_max=threshold_max, threshold_step=threshold_step, manifest_subset=manifest.iloc[train_idx], median_filter=median_filter)
         targets = {'min_sensitivity': float(min_sensitivity), 'min_specificity': float(min_specificity), 'method': threshold_method, 'threshold_min': float(threshold_min) if threshold_method == 'grid' else None, 'threshold_max': float(threshold_max) if threshold_method == 'grid' else None, 'threshold_step': float(threshold_step) if threshold_method == 'grid' else None}
-        validation_summary = _save_validation(output, manifest, train_idx, y_train, train_groups, val_scores, val_folds, fold_table, sweep, selected, targets, tune)
+        validation_summary = _save_validation(output, manifest, train_idx, y_train, train_groups, val_scores, val_folds, fold_table, sweep, selected, targets, tune, median_filter=median_filter)
         if selected is None:
             stopped = {'status': 'target_not_met', 'trainer_version': TRAINER_VERSION, 'decision_threshold': None, 'test_evaluated': False, 'validation': validation_summary, 'train_subjects': np.unique(train_groups).tolist(), 'test_subjects': np.unique(data['subject_id'][test_idx]).tolist()}
             _write_json(output / 'metrics.json', stopped)
@@ -694,7 +748,7 @@ def train(paths, output, test_size=0.25, seed=42, *, kernel='rbf', C=1.0, gamma=
     )
     y_test = data['y'][test_idx]
     report = classification_report(y_test, prediction, labels=[0, 1], target_names=['Non-FOG', 'FOG'], output_dict=True, zero_division=0)
-    metrics = {'model': 'SimpleImputer + StandardScaler + SVC', 'kernel': kernel, 'class_weight': 'balanced', 'decision_threshold': float(decision_threshold), 'seed': seed, 'status': 'completed', 'trainer_version': TRAINER_VERSION, 'threshold_selection': 'subject-grouped OOF validation' if threshold_tuning else 'fixed', 'threshold_tuning': bool(threshold_tuning), 'validation': validation_summary, 'accuracy': float(accuracy_score(y_test, prediction)), 'balanced_accuracy': float(balanced_accuracy_score(y_test, prediction)), 'fog_f1': float(f1_score(y_test, prediction, zero_division=0)), 'roc_auc': float(roc_auc_score(y_test, scores)), 'average_precision': float(average_precision_score(y_test, scores)), 'classification_report': report, 'confusion_matrix': confusion_matrix(y_test, prediction, labels=[0, 1]).tolist(), 'confusion_matrix_order': ['Non-FOG', 'FOG'], 'train_subjects': np.unique(train_groups).tolist(), 'test_subjects': np.unique(data['subject_id'][test_idx]).tolist(), 'train_windows': len(train_idx), 'test_windows': len(test_idx), 'n_features': len(names), 'tuning': bool(tune), 'cv_folds': cv_folds if tune else None, 'best_cv_fog_f1': best_score, 'best_params': best_params, 'svm_parameters': model.named_steps['svm'].get_params(), 'support_vectors': model.named_steps['svm'].n_support_.tolist(), 'config_verified': config['config_verified'], 'notes': config['notes'], 'evaluation': 'One held-out subject split. Tuning/scaler fit only on training subjects. Test never used for parameter selection.', 'versions': {'sklearn': sklearn.__version__, 'numpy': np.__version__, 'pandas': pd.__version__}}
+    metrics = {'model': 'SimpleImputer + StandardScaler + SVC', 'kernel': kernel, 'class_weight': class_weight, 'decision_threshold': float(decision_threshold), 'median_filter_window': int(median_filter), 'seed': seed, 'status': 'completed', 'trainer_version': TRAINER_VERSION, 'threshold_selection': 'subject-grouped OOF validation' if threshold_tuning else 'fixed', 'threshold_tuning': bool(threshold_tuning), 'validation': validation_summary, 'accuracy': float(accuracy_score(y_test, prediction)), 'balanced_accuracy': float(balanced_accuracy_score(y_test, prediction)), 'fog_f1': float(f1_score(y_test, prediction, zero_division=0)), 'roc_auc': float(roc_auc_score(y_test, scores)), 'average_precision': float(average_precision_score(y_test, scores)), 'classification_report': report, 'confusion_matrix': confusion_matrix(y_test, prediction, labels=[0, 1]).tolist(), 'confusion_matrix_order': ['Non-FOG', 'FOG'], 'train_subjects': np.unique(train_groups).tolist(), 'test_subjects': np.unique(data['subject_id'][test_idx]).tolist(), 'train_windows': len(train_idx), 'test_windows': len(test_idx), 'n_features': len(names), 'tuning': bool(tune), 'cv_folds': cv_folds if tune else None, 'best_cv_fog_f1': best_score, 'best_params': best_params, 'svm_parameters': model.named_steps['svm'].get_params(), 'support_vectors': model.named_steps['svm'].n_support_.tolist(), 'config_verified': config['config_verified'], 'notes': config['notes'], 'evaluation': 'One held-out subject split. Tuning/scaler fit only on training subjects. Test never used for parameter selection.', 'versions': {'sklearn': sklearn.__version__, 'numpy': np.__version__, 'pandas': pd.__version__}}
     metrics.update(diagnostic_metrics(y_test, prediction))
     output = Path(output)
     output.mkdir(parents=True, exist_ok=True)
@@ -703,8 +757,8 @@ def train(paths, output, test_size=0.25, seed=42, *, kernel='rbf', C=1.0, gamma=
     bundle['trainer_version'] = TRAINER_VERSION
     joblib.dump(bundle, output / 'fog_svm.joblib')
     (output / 'metrics.json').write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding='utf-8')
-    evaluation_names = ['sensitivity', 'specificity', 'ppv', 'npv', 'accuracy', 'youden_index', 'fog_f1', 'balanced_accuracy', 'roc_auc', 'average_precision']
-    pd.DataFrame([{'Metric': name, 'Value': metrics[name], 'Definition': {'sensitivity': 'Recall FOG = TP/(TP+FN)', 'specificity': 'Recall Non-FOG = TN/(TN+FP)', 'ppv': 'Precision FOG = TP/(TP+FP)', 'npv': 'Precision Non-FOG = TN/(TN+FN)', 'accuracy': '(TP+TN)/(TP+TN+FP+FN)', 'youden_index': 'Sensitivity + Specificity - 1', 'fog_f1': 'F1 of FOG class', 'balanced_accuracy': '(Sensitivity + Specificity)/2', 'roc_auc': 'ROC AUC from SVM decision scores', 'average_precision': 'Average precision from SVM decision scores'}[name], 'Unit': 'fraction; Youden ranges from -1 to 1'} for name in evaluation_names]).to_csv(output / 'evaluation_metrics.csv', index=False)
+    evaluation_names = ['sensitivity', 'specificity', 'geometric_mean', 'ppv', 'npv', 'accuracy', 'youden_index', 'fog_f1', 'balanced_accuracy', 'roc_auc', 'average_precision']
+    pd.DataFrame([{'Metric': name, 'Value': metrics[name], 'Definition': {'sensitivity': 'Recall FOG = TP/(TP+FN)', 'specificity': 'Recall Non-FOG = TN/(TN+FP)', 'geometric_mean': 'sqrt(Sensitivity * Specificity)', 'ppv': 'Precision FOG = TP/(TP+FP)', 'npv': 'Precision Non-FOG = TN/(TN+FN)', 'accuracy': '(TP+TN)/(TP+TN+FP+FN)', 'youden_index': 'Sensitivity + Specificity - 1', 'fog_f1': 'F1 of FOG class', 'balanced_accuracy': '(Sensitivity + Specificity)/2', 'roc_auc': 'ROC AUC from SVM decision scores', 'average_precision': 'Average precision from SVM decision scores'}[name], 'Unit': 'fraction; Youden ranges from -1 to 1'} for name in evaluation_names]).to_csv(output / 'evaluation_metrics.csv', index=False)
     (output / 'dataset_info.json').write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding='utf-8')
     (output / 'feature_names.json').write_text(json.dumps(names, indent=2), encoding='utf-8')
     split = np.full(len(data['y']), 'train', dtype='<U5')
@@ -714,10 +768,11 @@ def train(paths, output, test_size=0.25, seed=42, *, kernel='rbf', C=1.0, gamma=
     test_predictions = manifest.iloc[test_idx].copy()
     test_predictions['Raw_Prediction'] = raw_prediction
     test_predictions['Prediction'] = prediction
+    test_predictions['Median_Filter_Window'] = int(median_filter)
     test_predictions['FOG_Decision_Score'] = scores
     test_predictions['Decision_Threshold'] = float(decision_threshold)
     test_predictions.to_csv(output / 'test_predictions.csv', index=False)
-    _patient_metrics(y_test, scores, data['subject_id'][test_idx], decision_threshold).to_csv(output / 'test_patient_metrics.csv', index=False)
+    _patient_metrics(y_test, scores, data['subject_id'][test_idx], decision_threshold, manifest_subset=manifest.iloc[test_idx], median_filter=median_filter).to_csv(output / 'test_patient_metrics.csv', index=False)
     pd.DataFrame(metrics['confusion_matrix'], index=['Actual_NonFOG', 'Actual_FOG'], columns=['Predicted_NonFOG', 'Predicted_FOG']).to_csv(output / 'confusion_matrix.csv')
     if cv_results is not None:
         cv_results.to_csv(output / 'cv_results.csv', index=False)
@@ -769,13 +824,14 @@ def _resolve_svm_class_weight(class_weight, fog_penalty=None):
     raise ValueError("class_weight cho SVM phải là 'balanced' hoặc 'none'.")
 
 
-def _inner_fold_gm_stats(y, scores, folds, threshold):
-    """Bước 3 & Bước 4:
-    - Bước 3: Lấy dự đoán OOF trên từng inner validation fold và tính Sens_i, Spec_i.
+def _inner_fold_gm_stats(y, scores, folds, threshold, manifest_subset=None, median_filter=1):
+    """Bước 3 & Bước 4 (Đã đồng bộ Median Filter mode='nearest'):
+    - Bước 3: Lấy dự đoán OOF trên từng inner validation fold (sau khi lọc trung vị) và tính Sens_i, Spec_i.
     - Bước 4: Tính trung bình Sens và Spec giữa các inner folds, sau đó tính GM = sqrt(Mean_Sens * Mean_Spec).
     """
     sens_list, spec_list, fold_gms = [], [], []
-    pred_all = (np.asarray(scores, dtype=float) > float(threshold)).astype(np.int8)
+    raw_all = (np.asarray(scores, dtype=float) > float(threshold)).astype(np.int8)
+    pred_all = apply_median_postprocessing(manifest_subset, raw_all, median_filter) if manifest_subset is not None else raw_all
     for _, val_idx in folds:
         m = diagnostic_metrics(y[val_idx], pred_all[val_idx])
         if m['sensitivity'] is not None:
@@ -795,7 +851,7 @@ def _inner_fold_gm_stats(y, scores, folds, threshold):
         'Mean_Per_Fold_GM': mean_fold_gm,
     }
 
-def select_joint_parameters(pipeline, X, y, groups, *, tune=False, threshold_tuning=False, cv_folds=3, seed=42, kernel='rbf', decision_threshold=0.0, min_sensitivity=0.85, min_specificity=0.85, threshold_method='grid', threshold_min=-1.5, threshold_max=0.5, threshold_step=0.02, C_grid=None, gamma_grid=None, n_jobs=1, save_all_sweeps=False, output=None, selection_metric='gm'):
+def select_joint_parameters(pipeline, X, y, groups, *, tune=False, threshold_tuning=False, cv_folds=3, seed=42, kernel='rbf', decision_threshold=0.0, min_sensitivity=0.85, min_specificity=0.85, threshold_method='grid', threshold_min=-0.15, threshold_max=0.5, threshold_step=0.02, C_grid=None, gamma_grid=None, n_jobs=1, save_all_sweeps=False, output=None, selection_metric='gm', manifest_subset=None, median_filter=1):
     # Bước 1: Tạo inner SGKF trên tập outer training subjects
     folds = _group_folds(X, y, groups, cv_folds, seed)
     base = pipeline.get_params()
@@ -813,7 +869,7 @@ def select_joint_parameters(pipeline, X, y, groups, *, tune=False, threshold_tun
     for fold, (a, b) in enumerate(folds, 1):
         fold_ids[b] = fold
         fold_rows.append({'Fold': fold, 'Fit_Subjects': ','.join(np.unique(groups[a])), 'Validation_Subjects': ','.join(np.unique(groups[b])), 'Fit_Windows': len(a), 'Validation_Windows': len(b)})
-    print(f'Inner SGKF: {len(params_list)} candidates × {len(folds)} folds (metric={selection_metric}).', flush=True)
+    print(f'Inner SGKF: {len(params_list)} candidates × {len(folds)} folds (metric={selection_metric}, median_filter={median_filter}).', flush=True)
 
     # Bước 2: Chạy từng tổ hợp C và gamma trên các inner folds để lấy dự đoán OOF
     if n_jobs == 1:
@@ -824,7 +880,13 @@ def select_joint_parameters(pipeline, X, y, groups, *, tune=False, threshold_tun
     candidate_rows, sweeps = ([], [])
     for i, (params, scores) in enumerate(zip(params_list, all_scores), 1):
         if threshold_tuning:
-            sweep, selected = sweep_validation_thresholds(y, scores, min_sensitivity=min_sensitivity, min_specificity=min_specificity, method=threshold_method, threshold_min=threshold_min, threshold_max=threshold_max, threshold_step=threshold_step)
+            sweep, selected = sweep_validation_thresholds(
+                y, scores,
+                min_sensitivity=min_sensitivity, min_specificity=min_specificity,
+                method=threshold_method, threshold_min=threshold_min,
+                threshold_max=threshold_max, threshold_step=threshold_step,
+                manifest_subset=manifest_subset, median_filter=median_filter,
+            )
             if selected is not None:
                 row = sweep.loc[sweep.Decision_Threshold == selected].iloc[0]
             elif selection_metric == 'gm':
@@ -835,7 +897,8 @@ def select_joint_parameters(pipeline, X, y, groups, *, tune=False, threshold_tun
             record['Target_Met'] = selected is not None
             record['Threshold_Role'] = 'target_met' if selected is not None else f'fallback_best_{selection_metric}'
         else:
-            pred = (scores > decision_threshold).astype(np.int8)
+            raw_pred = (scores > decision_threshold).astype(np.int8)
+            pred = apply_median_postprocessing(manifest_subset, raw_pred, median_filter) if manifest_subset is not None else raw_pred
             result = diagnostic_metrics(y, pred)
             record = {
                 'Decision_Threshold': float(decision_threshold),
@@ -854,10 +917,10 @@ def select_joint_parameters(pipeline, X, y, groups, *, tune=False, threshold_tun
             }
             sweep = pd.DataFrame([record])
 
-        # Bước 3 & Bước 4: Tính Sensitivity, Specificity trên từng inner validation fold -> lấy trung bình -> tính GM
-        fold_gm_info = _inner_fold_gm_stats(y, scores, folds, record['Decision_Threshold'])
+        # Bước 3 & Bước 4: Tính Sensitivity, Specificity trên từng inner validation fold (đã lọc trung vị) -> lấy trung bình -> tính GM
+        fold_gm_info = _inner_fold_gm_stats(y, scores, folds, record['Decision_Threshold'], manifest_subset=manifest_subset, median_filter=median_filter)
         record.update(fold_gm_info)
-        record.update(Candidate_ID=i, C=params['svm__C'], Gamma=params['svm__gamma'])
+        record.update(Candidate_ID=i, C=params['svm__C'], Gamma=params['svm__gamma'], Median_Filter_Window=int(median_filter))
         candidate_rows.append(record)
         sweeps.append(sweep)
         if output is not None and save_all_sweeps:
@@ -896,6 +959,7 @@ def select_joint_parameters(pipeline, X, y, groups, *, tune=False, threshold_tun
         'C': float(chosen.C),
         'gamma': chosen.Gamma,
         'decision_threshold': float(chosen.Decision_Threshold),
+        'median_filter_window': int(median_filter),
         'selection_metric': selection_metric,
         'inner_fold_mean_sensitivity': float(chosen.Inner_Fold_Mean_Sensitivity),
         'inner_fold_mean_specificity': float(chosen.Inner_Fold_Mean_Specificity),
@@ -952,7 +1016,7 @@ def train_loso(
     min_sensitivity=0.85,
     min_specificity=0.85,
     threshold_method='grid',
-    threshold_min=-1.5,
+    threshold_min=-0.15,
     threshold_max=0.5,
     threshold_step=0.02,
     C_grid=None,
@@ -961,7 +1025,7 @@ def train_loso(
     save_all_sweeps=False,
     median_filter=1,
     cfs=False,
-    cfs_max_features=30,
+    cfs_max_features=None,
     selection_metric='gm',
     class_weight='balanced',
     fog_weight_ratio=None,
@@ -1020,6 +1084,7 @@ def train_loso(
         'cfs': bool(cfs),
         'cfs_max_features': int(cfs_max_features) if cfs else None,
         'median_filter_window': int(median_filter),
+        'median_filter_boundary_mode': 'nearest',
         'cache_size': cache_size,
         'n_jobs': n_jobs,
         'versions': {'sklearn': sklearn.__version__, 'numpy': np.__version__, 'pandas': pd.__version__},
@@ -1052,9 +1117,10 @@ def train_loso(
         directory.mkdir()
         manifest = _manifest(data, train_idx, test_idx)
         manifest.to_csv(directory / 'split_manifest.csv', index=False)
+        train_manifest = manifest.iloc[train_idx].copy()
 
         if needs_inner:
-            # Bước 1 -> Bước 5: Chọn C, gamma theo selection_metric (mặc định: 'gm' trên inner SGKF)
+            # Bước 1 -> Bước 5: Chọn C, gamma theo selection_metric trên chuỗi đã lọc trung vị mode='nearest'
             selected, inner_scores, inner_ids = select_joint_parameters(
                 pipeline,
                 X[train_idx],
@@ -1078,20 +1144,26 @@ def train_loso(
                 save_all_sweeps=save_all_sweeps,
                 output=directory,
                 selection_metric=selection_metric,
+                manifest_subset=train_manifest,
+                median_filter=median_filter,
             )
-            inner = manifest.iloc[train_idx].copy()
+            inner = train_manifest.copy()
             inner['Split'] = 'inner_validation_oof'
             inner['Inner_Fold'] = inner_ids
             inner['FOG_Decision_Score'] = inner_scores
             inner['Decision_Threshold'] = selected['decision_threshold']
-            inner['Prediction'] = (inner_scores > selected['decision_threshold']).astype(np.int8)
+            raw_inner_pred = (inner_scores > selected['decision_threshold']).astype(np.int8)
+            inner['Raw_Prediction'] = raw_inner_pred
+            inner['Prediction'] = apply_median_postprocessing(train_manifest, raw_inner_pred, median_filter)
+            inner['Median_Filter_Window'] = int(median_filter)
             inner.to_csv(directory / 'inner_validation_scores.csv', index=False)
-            _patient_metrics(y[train_idx], inner_scores, groups[train_idx], selected['decision_threshold']).to_csv(directory / 'inner_patient_metrics.csv', index=False)
+            _patient_metrics(y[train_idx], inner_scores, groups[train_idx], selected['decision_threshold'], manifest_subset=train_manifest, median_filter=median_filter).to_csv(directory / 'inner_patient_metrics.csv', index=False)
         else:
             selected = {
                 'C': float(C),
                 'gamma': gamma,
                 'decision_threshold': float(decision_threshold),
+                'median_filter_window': int(median_filter),
                 'selection_metric': selection_metric,
                 'target_met': None,
                 'threshold_role': 'fixed_baseline',
@@ -1128,6 +1200,7 @@ def train_loso(
             cfs_selected_features=cfs_selected_features,
             decision_threshold=float(threshold),
             median_filter_window=int(median_filter),
+            median_filter_boundary_mode='nearest',
             selected_parameters=selected,
             svm_parameters=model.named_steps['svm'].get_params(),
             support_vectors=model.named_steps['svm'].n_support_.tolist(),
@@ -1262,7 +1335,7 @@ def svm_main(argv=None):
     parser.add_argument('--min-sensitivity', type=float, default=0.85)
     parser.add_argument('--min-specificity', type=float, default=0.85)
     parser.add_argument('--threshold-method', choices=['grid', 'exact'], default='grid')
-    parser.add_argument('--threshold-min', type=float, default=-1.5)
+    parser.add_argument('--threshold-min', type=float, default=-0.15)
     parser.add_argument('--threshold-max', type=float, default=0.5)
     parser.add_argument('--threshold-step', type=float, default=0.02)
     parser.add_argument('--inner-cv-folds', type=int, default=None, help='Legacy holdout only; default 3. LOSO does not use a third CV level.')
@@ -1272,7 +1345,7 @@ def svm_main(argv=None):
     parser.add_argument('--save-all-sweeps', action='store_true', help='LOSO: save threshold sweeps for every parameter candidate (can be large)')
     parser.add_argument('--median-filter', type=_positive_odd_int, default=1, help='Cửa sổ lọc trung vị hậu xử lý theo Mazilu 2012 (1=tắt, 3, 5, 15, 31)')
     parser.add_argument('--cfs', action='store_true', help='Bật chọn lọc đặc trưng CFS (Mazilu 2012) bên trong từng fold')
-    parser.add_argument('--cfs-max-features', type=int, default=30, help='Số đặc trưng tối đa được CFS chọn (mặc định: 30)')
+    parser.add_argument('--cfs-max-features', type=int, default=None, help='Số đặc trưng tối đa được CFS chọn (nếu bỏ trống sẽ ưu tiên lấy từ GUI/NPZ, mặc định: 30)')
     parser.add_argument('--selection-metric', choices=['gm', 'f1', 'balanced_accuracy'], default='gm', help='Tiêu chí chọn C/gamma trong inner SGKF: gm (Geometric Mean - Ahlrichs 2016), f1, hoặc balanced_accuracy')
     parser.add_argument('--class-weight', choices=['balanced', 'none'], default='balanced', help='Weighted SVM (balanced theo Ahlrichs 2016) hoặc SVM thường (none) để đối chứng')
     parser.add_argument('--fog-weight-ratio', type=float, default=None, help='Tỷ lệ phạt cố định C+/C- cho lớp FOG (tùy chọn thay cho balanced tự động)')
@@ -1342,6 +1415,8 @@ def svm_main(argv=None):
         print(json.dumps(metrics, ensure_ascii=False, indent=2))
         parser.exit(2, 'TARGET_NOT_MET: xem validation_threshold_sweep.csv; test chưa được đánh giá.\n')
     print(json.dumps({key: metrics[key] for key in ['sensitivity', 'specificity', 'geometric_mean', 'ppv', 'npv', 'accuracy', 'youden_index', 'balanced_accuracy', 'fog_f1', 'roc_auc', 'average_precision', 'train_subjects', 'test_subjects']}, indent=2))
+
+
 def training_dataset(paths):
     data, names, info = load_datasets([Path(p) for p in paths])
     meta = pd.DataFrame({'Subject_ID': data['subject_id'], 'Recording_ID': data['recording_id'], 'Segment_ID': data['segment_id'], 'Window_ID': data['window_id'], 'Start_Time': data['window_start'], 'End_Time': data['window_end'], 'Binary_Label': data['y']})
@@ -1361,7 +1436,10 @@ from sklearn.impute import SimpleImputer
 from sklearn.metrics import confusion_matrix, roc_auc_score, average_precision_score
 from sklearn.model_selection import LeaveOneGroupOut, StratifiedGroupKFold, ParameterGrid
 from sklearn.pipeline import Pipeline
-from shap_fog import atomic_json
+try:
+    from shap_fog import atomic_json
+except ImportError:
+    atomic_json = _write_json
 RF_VERSION = 'fog-unified-v3-rf-loso'
 
 def rf_diagnostic_metrics(y, pred, scores=None):
