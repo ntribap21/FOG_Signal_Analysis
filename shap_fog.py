@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import tempfile
 import time
+from datetime import datetime, timedelta
 import warnings
 import numpy as np
 import pandas as pd
@@ -19,6 +20,24 @@ def atomic_json(path, value):
     path=Path(path);path.parent.mkdir(parents=True,exist_ok=True)
     tmp=path.with_name(path.name+'.tmp')
     tmp.write_text(json.dumps(value,ensure_ascii=False,indent=2,allow_nan=False),encoding='utf-8');os.replace(tmp,path)
+
+
+def format_duration(seconds):
+    seconds=max(0,int(round(float(seconds))))
+    hours,remainder=divmod(seconds,3600)
+    minutes,seconds=divmod(remainder,60)
+    return f'{hours}h {minutes:02d}m {seconds:02d}s' if hours else f'{minutes}m {seconds:02d}s'
+
+
+def report_eta(started_at,durations,completed,total):
+    if not durations or total<1:return
+    elapsed=time.monotonic()-started_at
+    average=float(np.mean(durations))
+    remaining=max(0,total-completed)*average
+    finish=datetime.now()+timedelta(seconds=remaining)
+    print(f'[ETA] SHAP: {completed}/{total} fold | trung bình/fold {format_duration(average)} | '
+          f'đã chạy {format_duration(elapsed)} | còn khoảng {format_duration(remaining)} | '
+          f'dự kiến xong {finish:%H:%M:%S}',flush=True)
 
 
 def read_dataset(paths):
@@ -264,18 +283,41 @@ def run(args):
     x,meta,names,config_ids=read_dataset(args.input)
     completed=[]
     hashes=[hashlib.sha256(Path(p).read_bytes()).hexdigest() for p in args.input]
-    for i,folder in enumerate(folders,1):
+
+    # Tách fold đã có SHAP hoàn tất khỏi các fold thực sự cần tính để ETA không bị thấp giả.
+    pending_folders=[]
+    skipped=0
+    for folder in folders:
+        manifest_path=folder/'shap/manifest.json'
+        if manifest_path.exists() and not args.overwrite:
+            prior=json.loads(manifest_path.read_text(encoding='utf-8'))
+            if prior.get('status')!='completed':
+                raise ValueError(f'{folder.name}: SHAP lần trước chưa hoàn tất; dùng --overwrite để tính lại.')
+            skipped+=1
+            print(f'{folder.name}: đã có SHAP hoàn tất, bỏ qua.',flush=True)
+        else:
+            pending_folders.append(folder)
+
+    total=len(pending_folders)
+    print(f'SHAP tổng số fold: {len(folders)} | đã có sẵn: {skipped} | cần tính: {total}',flush=True)
+    if total==0:
+        print('Tất cả fold đã có SHAP hoàn tất; không cần tính lại.',flush=True)
+        return completed
+
+    run_started=time.monotonic()
+    fold_durations=[]
+    print('ETA sẽ được ước tính sau khi hoàn tất fold SHAP đầu tiên.',flush=True)
+    for i,folder in enumerate(pending_folders,1):
         provenance_path=root/'dataset_info.json'
         if provenance_path.exists():
             provenance=json.loads(provenance_path.read_text(encoding='utf-8-sig')).get('input_sha256')
             if provenance and hashes!=list(provenance.values()):raise ValueError('SHA256 NPZ khác dữ liệu dùng train RF; dùng đúng NPZ và thứ tự input.')
-        started=time.monotonic();print(f'SHAP {i}/{len(folders)}: {folder.name}; background <= {args.background}, explain <= {args.explain}, nsamples={args.nsamples}',flush=True)
-        if (folder/'shap/manifest.json').exists() and not args.overwrite:
-            prior=json.loads((folder/'shap/manifest.json').read_text(encoding='utf-8'))
-            if prior.get('status')!='completed':raise ValueError('SHAP lần trước chưa hoàn tất; dùng --overwrite để tính lại.')
-            print('Đã có SHAP, bỏ qua. Dùng --overwrite để tính lại.',flush=True);continue
+        fold_started=time.monotonic()
+        print(f'SHAP {i}/{total}: {folder.name}; background <= {args.background}, explain <= {args.explain}, nsamples={args.nsamples}',flush=True)
         completed.append(explain_fold(root,folder,x,meta,names,config_ids,args))
-        print(f'Hoàn tất {folder.name}: {time.monotonic()-started:.1f}s',flush=True)
+        fold_durations.append(time.monotonic()-fold_started)
+        print(f'Hoàn tất {folder.name}: {format_duration(fold_durations[-1])}',flush=True)
+        report_eta(run_started,fold_durations,i,total)
     return completed
 
 

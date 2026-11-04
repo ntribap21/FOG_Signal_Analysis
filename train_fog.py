@@ -3,6 +3,8 @@ import argparse
 import hashlib
 import json
 import re
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 import joblib
 import numpy as np
@@ -505,6 +507,34 @@ TRAINER_VERSION = 'fog-unified-v3-svm-loso-2level-1'
 def _write_json(path, value):
     Path(path).write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False), encoding='utf-8')
 
+
+def _format_duration(seconds):
+    seconds = max(0, int(round(float(seconds))))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f'{hours}h {minutes:02d}m {seconds:02d}s'
+    return f'{minutes}m {seconds:02d}s'
+
+
+def _log_progress_eta(label, started_at, unit_durations, completed, total, unit='fold'):
+    # Ước tính từ thời gian thực tế của các đơn vị đã hoàn tất.
+    if not unit_durations or total < 1:
+        return
+    elapsed = time.monotonic() - started_at
+    average = float(np.mean(unit_durations))
+    remaining = max(0, total - completed) * average
+    finish_at = datetime.now() + timedelta(seconds=remaining)
+    print(
+        f'[ETA] {label}: {completed}/{total} {unit} | '
+        f'trung bình {unit}: {_format_duration(average)} | '
+        f'đã chạy: {_format_duration(elapsed)} | '
+        f'còn khoảng: {_format_duration(remaining)} | '
+        f'dự kiến xong: {finish_at:%H:%M:%S}',
+        flush=True,
+    )
+
+
 def _group_folds(X, y, groups, n_splits, seed, require_validation_classes=False):
     if not 2 <= n_splits <= len(np.unique(groups)):
         raise ValueError('Số CV fold cần từ 2 đến số bệnh nhân của tập fit.')
@@ -526,7 +556,7 @@ def _fit_model(pipeline, X, y, groups, *, tune, kernel, cv_folds, seed, n_jobs, 
     grid = {'svm__C': [0.1, 1.0, 10.0, 100.0]}
     if kernel == 'rbf':
         grid['svm__gamma'] = ['scale', 0.01, 0.1]
-    search = GridSearchCV(clone(pipeline), grid, scoring='f1', cv=folds, n_jobs=n_jobs, refit=True, error_score='raise', return_train_score=False)
+    search = GridSearchCV(clone(pipeline), grid, scoring='f1', cv=folds, n_jobs=n_jobs, refit=True, error_score='raise', return_train_score=False, verbose=2)
     print(f'{prefix}: tuning C/gamma, {cv_folds} grouped folds, F1(FOG).', flush=True)
     search.fit(X, y)
     records = pd.DataFrame([{'Fold': i, 'Fit_Subjects': ','.join(np.unique(groups[a])), 'Validation_Subjects': ','.join(np.unique(groups[b]))} for i, (a, b) in enumerate(folds, 1)])
@@ -873,9 +903,23 @@ def select_joint_parameters(pipeline, X, y, groups, *, tune=False, threshold_tun
 
     # Bước 2: Chạy từng tổ hợp C và gamma trên các inner folds để lấy dự đoán OOF
     if n_jobs == 1:
-        all_scores = [_candidate_scores(pipeline, X, y, folds, params) for params in params_list]
+        tuning_started = time.monotonic()
+        candidate_durations = []
+        all_scores = []
+        for candidate_i, params in enumerate(params_list, 1):
+            candidate_started = time.monotonic()
+            all_scores.append(_candidate_scores(pipeline, X, y, folds, params))
+            candidate_durations.append(time.monotonic() - candidate_started)
+            _log_progress_eta(
+                'SVM inner tuning candidates', tuning_started,
+                candidate_durations, candidate_i, len(params_list), 'candidate',
+            )
     else:
-        all_scores = joblib.Parallel(n_jobs=n_jobs)((joblib.delayed(_candidate_scores)(pipeline, X, y, folds, params) for params in params_list))
+        print('SVM inner tuning chạy song song; Joblib sẽ in tiến độ tác vụ.', flush=True)
+        all_scores = joblib.Parallel(n_jobs=n_jobs, verbose=5)(
+            joblib.delayed(_candidate_scores)(pipeline, X, y, folds, params)
+            for params in params_list
+        )
 
     candidate_rows, sweeps = ([], [])
     for i, (params, scores) in enumerate(zip(params_list, all_scores), 1):
@@ -1110,7 +1154,11 @@ def train_loso(
     pipeline = Pipeline(steps)
 
     subject_rows, predictions_all, fold_records, seen = ([], [], [], np.zeros(len(y), dtype=int))
+    loso_started = time.monotonic()
+    loso_fold_durations = []
+    print(f'LOSO bắt đầu: {len(outer_folds)} outer folds. ETA sẽ được ước tính sau fold đầu tiên.', flush=True)
     for fold, (train_idx, test_idx) in enumerate(outer_folds, 1):
+        fold_started = time.monotonic()
         subject = str(groups[test_idx][0])
         print(f"LOSO {fold}/{len(outer_folds)}: TEST {subject}; TRAIN {', '.join(np.unique(groups[train_idx]))}", flush=True)
         directory = output / f'fold_{fold:02d}_{subject}'
@@ -1260,6 +1308,8 @@ def train_loso(
             }
             joblib.dump(bundle, directory / 'fog_svm.joblib')
         _write_json(output / 'run_status.json', {'status': 'running', 'completed_subjects': [row['Subject_ID'] for row in subject_rows]})
+        loso_fold_durations.append(time.monotonic() - fold_started)
+        _log_progress_eta('SVM LOSO', loso_started, loso_fold_durations, fold, len(outer_folds), 'outer fold')
 
     if not np.all(seen == 1):
         raise ValueError('LOSO cần mỗi cửa sổ được test đúng một lần.')
@@ -1517,7 +1567,10 @@ def rf_select_parameters(x, y, subjects, args):
             raise ValueError('Inner split không hợp lệ hoặc train thiếu một lớp; giảm --cv-folds.')
     grid = list(ParameterGrid(dict(n_estimators=args.rf_n_estimators_grid, max_depth=args.rf_max_depth_grid, min_samples_leaf=args.rf_min_samples_leaf_grid, max_features=[args.rf_max_features]))) if args.tune else [default]
     records = []
-    for params in grid:
+    tuning_started = time.monotonic()
+    candidate_durations = []
+    for candidate_i, params in enumerate(grid, 1):
+        candidate_started = time.monotonic()
         oof = np.full(len(y), np.nan)
         for rf_train, valid in folds:
             model = rf_make_model(args, params)
@@ -1529,6 +1582,8 @@ def rf_select_parameters(x, y, subjects, args):
         for threshold in thresholds:
             stats = rf_diagnostic_metrics(y, (oof > threshold).astype(int))
             records.append(dict(parameters=params, threshold=float(threshold), sensitivity=stats['sensitivity'], specificity=stats['specificity'], balanced_accuracy=stats['balanced_accuracy'], target_met=bool(stats['sensitivity'] >= args.min_sensitivity and stats['specificity'] >= args.min_specificity)))
+        candidate_durations.append(time.monotonic() - candidate_started)
+        _log_progress_eta('RF inner tuning candidates', tuning_started, candidate_durations, candidate_i, len(grid), 'candidate')
     best = max(records, key=lambda r: (r['target_met'], r['balanced_accuracy'], r['specificity'], -abs(r['threshold'] - 0.5)))
     selection = dict(threshold_role='inner_oof_selected' if args.threshold_tuning else 'fixed_threshold_inner_model_selection', target_met=best['target_met'], inner_sensitivity=best['sensitivity'], inner_specificity=best['specificity'], inner_balanced_accuracy=best['balanced_accuracy'], selection_rule='Meet both targets first, then best pooled inner OOF balanced accuracy; otherwise best balanced accuracy', inner_folds=n_splits)
     return (best['parameters'], best['threshold'], selection, records)
@@ -1561,8 +1616,13 @@ def rf_train(args):
     atomic_json(output / 'feature_names.json', names)
     atomic_json(output / 'dataset_info.json', dict(input_files=list(input_hashes), input_sha256=input_hashes, input_schema='wide', configurations=configurations, n_windows=len(y), config_ids=sorted(ids)))
     tables, subject_metrics, completed, fold_manifest = ([], [], [], [])
+    rf_outer_folds = list(LeaveOneGroupOut().split(x, y, subjects))
+    rf_started = time.monotonic()
+    rf_fold_durations = []
+    print(f'RF LOSO bắt đầu: {len(rf_outer_folds)} outer folds. ETA sẽ được ước tính sau fold đầu tiên.', flush=True)
     try:
-        for i, (train_rows, test_rows) in enumerate(LeaveOneGroupOut().split(x, y, subjects), 1):
+        for i, (train_rows, test_rows) in enumerate(rf_outer_folds, 1):
+            fold_started = time.monotonic()
             subject = str(subjects[test_rows[0]])
             if len(np.unique(y[train_rows])) != 2:
                 raise ValueError(f'{subject}: outer train thiếu một lớp.')
@@ -1603,6 +1663,8 @@ def rf_train(args):
             fold_manifest.append(dict(Outer_Fold=i, Test_Subject=subject, Train_Subjects=','.join(stat['train_subjects']), Train_Windows=len(train_rows), Test_Windows=len(test_rows), Decision_Threshold=threshold))
             completed.append(subject)
             atomic_json(output / 'run_status.json', dict(status='running', completed_subjects=completed))
+            rf_fold_durations.append(time.monotonic() - fold_started)
+            _log_progress_eta('RF LOSO', rf_started, rf_fold_durations, i, len(rf_outer_folds), 'outer fold')
         combined = pd.concat(tables, ignore_index=True)
         combined.to_csv(output / 'loso_predictions.csv', index=False)
         pd.DataFrame(subject_metrics).to_csv(output / 'loso_subject_metrics.csv', index=False)
