@@ -394,7 +394,7 @@ from PySide6.QtWidgets import QTabWidget, QScrollArea, QLineEdit
 import copy
 from signal_processing import Config, ProcessingEngine, gui_read_raw, gui_labels, gui_split, gui_select, gui_process, gui_windows, gui_feature_rows, canonical_config, normalize_exclusions, merge_configs, recording_id, window_feature_records
 from data_prepare import prepare_files, export_dataset, gui_export
-from feature_registry import BASE, GROUPS, DEFAULTS, options as feature_options, feature_names, axis_names, window_names
+from feature_registry import BASE, DEFAULTS, AXIS_FEATURE_SECTIONS, WINDOW_FEATURE_SECTIONS, WINDOW_FEATURE_SECTION_GROUPS, options as feature_options, feature_names, axis_names, window_names
 
 class FOGSignalAnalyzer(QMainWindow):
     """Single GUI class; shared signal_processing owns the numerical pipeline."""
@@ -469,7 +469,12 @@ class FOGSignalAnalyzer(QMainWindow):
         self.setMinimumSize(1200, 680)
         self._copy_analysis_to_batch()
         self.restore_saved_config()
-        self.setWindowTitle('FOG Signal Analyzer — v1.3 Feature Selection')
+        # All feature panels are now built, including the windowing sensor/axis controls.
+        self._update_feature_availability('analysis')
+        self._update_feature_availability('batch')
+        self._update_feature_summary()
+        self._batch_changed()
+        self.setWindowTitle('FOG Signal Analyzer — Individual Feature Selection')
 
 
     def restore_saved_config(self):
@@ -479,7 +484,6 @@ class FOGSignalAnalyzer(QMainWindow):
             return
         try:
             config = Config.from_dict(json.loads(path.read_text(encoding='utf-8')))
-            self._restore_feature_options('analysis',config)
             widgets = [getattr(self, name) for name in self.CONTROL_NAMES]
             widgets += [self.selection_mode, self.selection_start, self.selection_end, self.selection_exclude]
             # Validate first, avoiding silent widget clamping.
@@ -512,6 +516,8 @@ class FOGSignalAnalyzer(QMainWindow):
             finally:
                 for widget in widgets:
                     widget.blockSignals(False)
+            self._restore_feature_options('analysis', config)
+            self._update_feature_availability('analysis')
             self._set_batch_config(config)
             self.toggle_resample_controls()
             self.toggle_filter_controls()
@@ -2398,76 +2404,99 @@ class FOGSignalAnalyzer(QMainWindow):
         self._batch_changed()
 
     def _feature_panel(self, scope):
-        box = QGroupBox('FEATURES')
+        """Mỗi công thức là một checkbox; dùng chung cho Analysis và Batch."""
+        box = QGroupBox('INDIVIDUAL FEATURE SELECTION')
         layout = QVBoxLayout(box)
-        base = QGroupBox('BASIC FEATURES — choose individually')
-        grid = QGridLayout(base)
-        grid.setObjectName('feature_base_grid')
-        basechecks = {}
-        for i, name in enumerate(BASE):
-            w = QCheckBox(name.replace('_', ' '))
-            w.setChecked(True)
-            basechecks[name] = w
-            grid.addWidget(w, i // 4, i % 4)
-            w.toggled.connect(lambda _=False, sc=scope: self._features_changed(sc))
-        buttons = QHBoxLayout()
-        for label, value in [('ALL BASIC', True), ('NO BASIC', False)]:
-            b = QPushButton(label)
-            b.clicked.connect(lambda _=False, sc=scope, v=value: self._set_feature_checks(sc, 'base', v))
-            buttons.addWidget(b)
-        grid.addLayout(buttons, (len(BASE) + 3) // 4, 0, 1, 4)
-        layout.addWidget(base)
+        layout.setSpacing(8)
 
-        extras = QGroupBox('ADDITIONAL FEATURE GROUPS')
-        g = QGridLayout(extras)
-        checks = {}
-        for i, (key, label) in enumerate(GROUPS.items()):
-            w = QCheckBox(label)
-            checks[key] = w
-            g.addWidget(w, i // 2, i % 2)
-            if key == 'cwt':
-                w.setToolTip(
-                    'Nhánh 1: db4; 0.5–3 / 3–8 Hz; bước 0.5 Hz; CHỈ tính trên trục Forward (Anterior-Posterior).'
-                )
-            elif key == 'rodriguez_axis':
-                w.setToolTip(
-                    '25 đặc trưng/trục: Mean/Std/Entropy Locomotor & Freeze, Freq_Std_Low (0.1–0.68Hz)/High (8–20Hz), AR_1..12, Integrals, Peak Amp/Freq.'
-                )
-            elif key == 'rodriguez_window':
-                w.setToolTip(
-                    '8 đặc trưng đa trục/cảm biến: Spectral_CoM (0.1–8Hz), Increments_AP, Diff_Inc_XY/XZ/YZ, PCA_1..3 (cần đủ 3 trục).'
-                )
-            if scope == 'analysis' and key in ('crosscorr', 'ater'):
-                w.setEnabled(False)
-                w.setToolTip('Use Batch with all three axes and the required sensors.')
-            w.toggled.connect(lambda _=False, sc=scope: self._features_changed(sc))
-        ebtns = QHBoxLayout()
-        for label, value in [('ALL ADDITIONAL', True), ('NO ADDITIONAL', False)]:
-            b = QPushButton(label)
-            b.clicked.connect(lambda _=False, sc=scope, v=value: self._set_feature_checks(sc, 'extra', v))
-            ebtns.addWidget(b)
-        g.addLayout(ebtns, (len(GROUPS) + 1) // 2, 0, 1, 2)
-        layout.addWidget(extras)
+        action_row = QHBoxLayout()
+        select_all = self._button(
+            'SELECT ALL AVAILABLE FEATURES',
+            lambda _=False, sc=scope: self._set_all_features(sc, True)
+        )
+        clear_all = self._button(
+            'DESELECT ALL FEATURES',
+            lambda _=False, sc=scope: self._set_all_features(sc, False)
+        )
+        action_row.addWidget(select_all)
+        action_row.addWidget(clear_all)
+        layout.addLayout(action_row)
+        layout.addWidget(self._note(
+            'Mỗi checkbox tương ứng một feature được tính và xuất độc lập. '
+            'Những feature cần đủ trục / nhiều cảm biến sẽ tự khóa khi cấu hình hiện tại chưa đáp ứng.'
+        ))
 
-        cfs_group = QGroupBox('CORRELATION-BASED FEATURE SUBSET SELECTION (CFS — Mazilu 2012)')
+        axis_checks = {}
+        for section_title, feature_list in AXIS_FEATURE_SECTIONS.items():
+            group = QGroupBox(section_title)
+            grid = QGridLayout(group)
+            grid.setHorizontalSpacing(12)
+            grid.setVerticalSpacing(4)
+            for i, feature in enumerate(feature_list):
+                check = QCheckBox(feature.replace('_', ' '))
+                check.setChecked(feature in BASE)
+                check.setToolTip(
+                    f'{feature}: feature được tính riêng cho từng sensor và từng axis đã chọn.'
+                )
+                check.toggled.connect(
+                    lambda _=False, sc=scope: self._features_changed(sc)
+                )
+                axis_checks[feature] = check
+                grid.addWidget(check, i // 4, i % 4)
+            for col in range(4):
+                grid.setColumnStretch(col, 1)
+            layout.addWidget(group)
+
+        window_checks = {}
+        for section_title, feature_list in WINDOW_FEATURE_SECTIONS.items():
+            group = QGroupBox(section_title)
+            grid = QGridLayout(group)
+            grid.setHorizontalSpacing(12)
+            grid.setVerticalSpacing(4)
+            section_key = WINDOW_FEATURE_SECTION_GROUPS[section_title]
+            section_checks = {}
+            for i, feature in enumerate(feature_list):
+                check = QCheckBox(feature.replace('_', ' '))
+                check.setChecked(False)
+                check.setToolTip(
+                    f'{feature}: chỉ tính khi bật checkbox này; kết quả được mở rộng theo sensor / axis / cặp sensor phù hợp.'
+                )
+                check.toggled.connect(
+                    lambda _=False, sc=scope: self._features_changed(sc)
+                )
+                section_checks[feature] = check
+                grid.addWidget(check, i // 3, i % 3)
+            for col in range(3):
+                grid.setColumnStretch(col, 1)
+            window_checks[section_key] = section_checks
+            layout.addWidget(group)
+
+        # CFS is a training-time selector, not a signal feature checkbox.
+        cfs_group = QGroupBox('CORRELATION-BASED FEATURE SUBSET SELECTION (CFS)')
         cfs_layout = QGridLayout(cfs_group)
-        cfs_check = QCheckBox('Enable CFS (lọc tập con đặc trưng tối ưu theo độ đo Merit bên trong từng fold train)')
+        cfs_check = QCheckBox(
+            'Enable CFS inside each training fold (LOSO-safe feature selection)'
+        )
         cfs_check.setChecked(DEFAULTS.get('cfs', False))
         cfs_spin = QSpinBox()
         cfs_spin.setRange(1, 500)
         cfs_spin.setValue(DEFAULTS.get('cfs_max_features', 30))
         cfs_spin.setEnabled(cfs_check.isChecked())
         cfs_check.toggled.connect(cfs_spin.setEnabled)
-        cfs_check.toggled.connect(lambda _=False, sc=scope: self._features_changed(sc))
-        cfs_spin.valueChanged.connect(lambda _=None, sc=scope: self._features_changed(sc))
+        cfs_check.toggled.connect(
+            lambda _=False, sc=scope: self._features_changed(sc)
+        )
+        cfs_spin.valueChanged.connect(
+            lambda _=None, sc=scope: self._features_changed(sc)
+        )
         cfs_layout.addWidget(cfs_check, 0, 0, 1, 2)
-        cfs_layout.addWidget(QLabel('Max selected features (k):'), 1, 0)
+        cfs_layout.addWidget(QLabel('Maximum selected features (k):'), 1, 0)
         cfs_layout.addWidget(cfs_spin, 1, 1)
         layout.addWidget(cfs_group)
 
         params = {'cfs': cfs_check, 'cfs_max_features': cfs_spin}
         settings = QGroupBox('FEATURE PARAMETERS')
-        g = QGridLayout(settings)
+        settings_grid = QGridLayout(settings)
         choices = {
             'wavelet_name': ['db4', 'db8'],
             'wavelet_mode': ['symmetric', 'periodization'],
@@ -2475,85 +2504,253 @@ class FOGSignalAnalyzer(QMainWindow):
         }
         labels = {
             'wavelet_name': 'DWT wavelet',
-            'wavelet_level': 'DWT level',
+            'wavelet_level': 'DWT maximum level',
             'wavelet_mode': 'DWT extension',
             'magnitude_mode': 'Magnitude mode',
             'harmonic_f0_hz': 'Harmonic fundamental (Hz)',
             'harmonic_count': 'Number of harmonics',
             'temporal_history': 'Trend history (windows)',
+            'entropy_m': 'Entropy embedding dimension',
+            'entropy_r_ratio': 'Entropy tolerance ratio',
+            'autocorr_min_s': 'Autocorrelation minimum lag (s)',
+            'autocorr_max_s': 'Autocorrelation maximum lag (s)',
+            'crosscorr_max_s': 'Cross-correlation maximum lag (s)',
+            'ater_epsilon_g2': 'ATER epsilon (g²)',
         }
-        param_keys = [k for k in DEFAULTS if k not in ('cfs', 'cfs_max_features')]
+        param_keys = [
+            key for key in DEFAULTS
+            if key not in ('cfs', 'cfs_max_features')
+        ]
         for i, key in enumerate(param_keys):
             default = DEFAULTS[key]
             if key in choices:
-                w = QComboBox()
-                w.addItems(choices[key])
-                w.setCurrentText(default)
-                w.currentTextChanged.connect(lambda _=None, sc=scope: self._features_changed(sc))
+                widget = QComboBox()
+                widget.addItems(choices[key])
+                widget.setCurrentText(default)
+                widget.currentTextChanged.connect(
+                    lambda _=None, sc=scope: self._features_changed(sc)
+                )
             elif type(default) is int:
-                w = QSpinBox()
-                w.setRange(1 if key in ('entropy_m', 'wavelet_level') else 2, 3 if key == 'entropy_m' else 5 if key == 'wavelet_level' else 20)
-                w.setValue(default)
-                w.valueChanged.connect(lambda _=None, sc=scope: self._features_changed(sc))
+                widget = QSpinBox()
+                widget.setRange(
+                    1 if key in ('entropy_m', 'wavelet_level') else 2,
+                    3 if key == 'entropy_m' else 5 if key == 'wavelet_level' else 20
+                )
+                widget.setValue(default)
+                widget.valueChanged.connect(
+                    lambda _=None, sc=scope: self._features_changed(sc)
+                )
             else:
-                w = QDoubleSpinBox()
-                w.setDecimals(10 if key == 'ater_epsilon_g2' else 3)
-                w.setRange(1e-10 if key == 'ater_epsilon_g2' else 0.001, 1.0 if key in ('entropy_r_ratio', 'crosscorr_max_s') else 10.0)
-                w.setValue(default)
-                w.valueChanged.connect(lambda _=None, sc=scope: self._features_changed(sc))
-            params[key] = w
-            g.addWidget(QLabel(labels.get(key, key)), i // 2, (i % 2) * 2)
-            g.addWidget(w, i // 2, (i % 2) * 2 + 1)
+                widget = QDoubleSpinBox()
+                widget.setDecimals(10 if key == 'ater_epsilon_g2' else 3)
+                widget.setRange(
+                    1e-10 if key == 'ater_epsilon_g2' else 0.001,
+                    1.0 if key in ('entropy_r_ratio', 'crosscorr_max_s') else 10.0
+                )
+                widget.setValue(default)
+                widget.valueChanged.connect(
+                    lambda _=None, sc=scope: self._features_changed(sc)
+                )
+            params[key] = widget
+            settings_grid.addWidget(QLabel(labels.get(key, key)), i // 2, (i % 2) * 2)
+            settings_grid.addWidget(widget, i // 2, (i % 2) * 2 + 1)
         layout.addWidget(settings)
+
         layout.addWidget(self._note(
-            'Nhánh 1 (CWT): Chỉ tính trên trục Forward (Anterior). Nhánh 2: Các nhóm đặc trưng còn lại (bao gồm Rodriguez 2017, Ahlrichs 2016, Mazilu 2012). '
-            'Khi tích chọn CFS, cờ cấu hình sẽ được lưu vào NPZ/JSON và tự động kích hoạt CFSSelector bên trong từng fold khi chạy train_fog.py.'
+            'DWT: mỗi level/statistic có checkbox riêng. Rodriguez/Mazilu: mỗi hệ số hoặc chỉ số có checkbox riêng. '
+            'CWT chỉ dùng Forward; magnitude và PCA cần đủ ba trục; cross-correlation cần ít nhất hai sensor; ATER cần Ankle + Trunk.'
         ))
-        setattr(self, scope + '_base_checks', basechecks)
-        setattr(self, scope + '_feature_checks', checks)
+
+        setattr(self, scope + '_axis_feature_checks', axis_checks)
+        setattr(self, scope + '_window_feature_checks', window_checks)
         setattr(self, scope + '_feature_params', params)
+        self._update_feature_availability(scope)
         return box
 
-    def _get_feature_options(self, scope):
-        checks = getattr(self, scope + '_feature_checks', {})
+    def _set_all_features(self, scope, checked):
+        """Select every currently available feature, or clear every feature."""
+        widgets = list(getattr(self, scope + '_axis_feature_checks', {}).values())
+        for section in getattr(self, scope + '_window_feature_checks', {}).values():
+            widgets.extend(section.values())
+        for widget in widgets:
+            widget.blockSignals(True)
+            widget.setChecked(bool(checked) and widget.isEnabled())
+            widget.blockSignals(False)
+        self._features_changed(scope)
+
+    def _features_changed(self, scope):
+        if self._building:
+            return
+        self._update_feature_availability(scope)
+        if scope == 'analysis':
+            self._invalidate_windows()
+            self._update_feature_summary()
+            self.statusBar().showMessage(
+                'Feature selection changed. Generate windows again before export.'
+            )
+        else:
+            self._batch_changed()
+
+    def _update_feature_availability(self, scope):
+        """Disable feature choices whose sensor/axis requirements are not met."""
+        axis_checks = getattr(self, scope + '_window_feature_checks', {})
+        if not axis_checks:
+            return
+
+        if scope == 'analysis':
+            sensors = (
+                [self.windowing_sensor_combo.currentText()]
+                if hasattr(self, 'windowing_sensor_combo') else []
+            )
+            axes = [
+                axis for axis, name in zip(
+                    GUI_AXES,
+                    [
+                        'windowing_axis_x_checkbox',
+                        'windowing_axis_y_checkbox',
+                        'windowing_axis_z_checkbox',
+                    ]
+                )
+                if hasattr(self, name) and getattr(self, name).isChecked()
+            ]
+        else:
+            sensors = [
+                sensor for sensor, widget in getattr(self, 'batch_sensor_checks', {}).items()
+                if widget.isChecked()
+            ]
+            axes = [
+                axis for axis, widget in getattr(self, 'batch_axis_checks', {}).items()
+                if widget.isChecked()
+            ]
+
+        all_axes = set(axes) == set(GUI_AXES)
+        all_sensors = set(sensors)
+
+        # DWT feature checkboxes are limited by the configured decomposition level.
         params = getattr(self, scope + '_feature_params', {})
-        base = getattr(self, scope + '_base_checks', {})
-        param_values = {}
-        for k, w in params.items():
-            if isinstance(w, QCheckBox):
-                param_values[k] = w.isChecked()
-            elif isinstance(w, QComboBox):
-                param_values[k] = w.currentText()
+        level_widget = params.get('wavelet_level')
+        wavelet_level = level_widget.value() if level_widget is not None else 4
+        axis_checks = getattr(self, scope + '_axis_feature_checks', {})
+        for feature, widget in axis_checks.items():
+            if feature == 'Wavelet_D3_D4_Energy_Ratio':
+                available = wavelet_level >= 4
+                reason = 'Feature này cần DWT level >= 4.'
+            elif feature.startswith('Wavelet_D'):
+                try:
+                    feature_level = int(feature.split('_')[1][1:])
+                except (IndexError, ValueError):
+                    feature_level = 99
+                available = feature_level <= wavelet_level
+                reason = f'Feature này cần DWT level >= {feature_level}.'
             else:
-                param_values[k] = w.value()
+                continue
+            widget.setEnabled(available)
+            widget.setToolTip(
+                f'{feature}: DWT decomposition.' if available else reason
+            )
+            if not available and widget.isChecked():
+                widget.blockSignals(True)
+                widget.setChecked(False)
+                widget.blockSignals(False)
+
+        requirements = {
+            'magnitude': (all_axes, 'Magnitude cần đủ Forward, Vertical và Lateral.'),
+            'crosscorr': (
+                len(sensors) >= 2 and all_axes,
+                'Cross-correlation cần ít nhất hai sensor và đủ ba trục.'
+            ),
+            'ater': (
+                {'Ankle', 'Trunk'}.issubset(all_sensors) and all_axes,
+                'ATER cần cả Ankle, Trunk và đủ ba trục.'
+            ),
+            'cwt': ('Forward' in axes, 'CWT cần chọn trục Forward.'),
+            'rodriguez_window': (all_axes, 'PCA / Rodriguez multi-axis cần đủ ba trục.'),
+        }
+
+        for group, checks in axis_checks.items():
+            if group == 'corr':
+                for feature, widget in checks.items():
+                    axes_pair = feature.removeprefix('Corr_').split('_', 1)
+                    available = all(axis in axes for axis in axes_pair)
+                    widget.setEnabled(available)
+                    widget.setToolTip(
+                        'Tính tương quan cho cặp trục này.'
+                        if available else
+                        f'{feature} cần chọn cả hai trục {axes_pair[0]} và {axes_pair[1]}.'
+                    )
+                    if not available and widget.isChecked():
+                        widget.blockSignals(True)
+                        widget.setChecked(False)
+                        widget.blockSignals(False)
+                continue
+
+            available, reason = requirements.get(group, (True, ''))
+            for widget in checks.values():
+                widget.setEnabled(available)
+                if reason:
+                    widget.setToolTip(reason)
+                if not available and widget.isChecked():
+                    widget.blockSignals(True)
+                    widget.setChecked(False)
+                    widget.blockSignals(False)
+
+    def _get_feature_options(self, scope):
+        axis_checks = getattr(self, scope + '_axis_feature_checks', {})
+        window_checks = getattr(self, scope + '_window_feature_checks', {})
+        params = getattr(self, scope + '_feature_params', {})
+        param_values = {}
+        for key, widget in params.items():
+            if isinstance(widget, QCheckBox):
+                param_values[key] = widget.isChecked()
+            elif isinstance(widget, QComboBox):
+                param_values[key] = widget.currentText()
+            else:
+                param_values[key] = widget.value()
+
         return {
-            **{k: w.isChecked() for k, w in checks.items()},
+            'axis_features': [
+                key for key, widget in axis_checks.items() if widget.isChecked()
+            ],
+            'window_features': {
+                group: [
+                    key for key, widget in checks.items() if widget.isChecked()
+                ]
+                for group, checks in window_checks.items()
+            },
             **param_values,
-            'base_features': [k for k, w in base.items() if w.isChecked()] if base else list(BASE),
         }
 
     def _restore_feature_options(self, scope, config):
         values = feature_options(config)
-        for k, w in getattr(self, scope + '_base_checks', {}).items():
-            w.blockSignals(True)
-            w.setChecked(k in values['base_features'])
-            w.blockSignals(False)
-        for k, w in getattr(self, scope + '_feature_checks', {}).items():
-            w.blockSignals(True)
-            w.setChecked(values[k] if w.isEnabled() else False)
-            w.blockSignals(False)
-        for k, w in getattr(self, scope + '_feature_params', {}).items():
-            w.blockSignals(True)
-            if isinstance(w, QCheckBox):
-                w.setChecked(bool(values.get(k, False)))
-            elif isinstance(w, QComboBox):
-                w.setCurrentText(values[k])
-            else:
-                w.setValue(values[k])
-            w.blockSignals(False)
+        selected_axis = set(values['axis_features'])
+        selected_window = values['window_features']
+
+        for key, widget in getattr(self, scope + '_axis_feature_checks', {}).items():
+            widget.blockSignals(True)
+            widget.setChecked(key in selected_axis)
+            widget.blockSignals(False)
+
+        for group, checks in getattr(self, scope + '_window_feature_checks', {}).items():
+            selected = set(selected_window.get(group, []))
+            for key, widget in checks.items():
+                widget.blockSignals(True)
+                widget.setChecked(key in selected)
+                widget.blockSignals(False)
+
         params = getattr(self, scope + '_feature_params', {})
+        for key, widget in params.items():
+            widget.blockSignals(True)
+            if isinstance(widget, QCheckBox):
+                widget.setChecked(bool(values.get(key, False)))
+            elif isinstance(widget, QComboBox):
+                widget.setCurrentText(values[key])
+            else:
+                widget.setValue(values[key])
+            widget.blockSignals(False)
+
         if 'cfs' in params and 'cfs_max_features' in params:
             params['cfs_max_features'].setEnabled(params['cfs'].isChecked())
+        self._update_feature_availability(scope)
 
     def _show_selected_window_features(self, wid, meta, sensor, axis, values):
         config = self.window_config or self.capture_config()
@@ -2812,6 +3009,7 @@ class FOGSignalAnalyzer(QMainWindow):
 
     def _window_changed(self, *args):
         if not self._building:
+            self._update_feature_availability('analysis')
             self._invalidate_windows()
 
     def _selection_preview(self):
@@ -2994,7 +3192,6 @@ class FOGSignalAnalyzer(QMainWindow):
             return
         try:
             config = Config.from_dict(json.loads(Path(path).read_text(encoding='utf-8')))
-            self._restore_feature_options('analysis',config)
             if config.get('schema') not in ('original-core-gui-v1','fog-unified-v1'):
                 raise ValueError('JSON không thuộc phiên bản GUI dùng core gốc này.')
             for name in self.CONTROL_NAMES:
@@ -3042,6 +3239,8 @@ class FOGSignalAnalyzer(QMainWindow):
             self.toggle_filter_controls()
             self.toggle_detrend_controls()
             self.update_window_label_controls()
+            self._restore_feature_options('analysis', config)
+            self._update_feature_availability('analysis')
             self.excluded_regions = normalize_exclusions(config.get('excluded_regions', {}))
             self._refresh_exclusions()
             self._selection_changed()
@@ -3169,6 +3368,7 @@ class FOGSignalAnalyzer(QMainWindow):
     def _batch_changed(self, *args):
         if not hasattr(self, 'batch_summary'):
             return
+        self._update_feature_availability('batch')
         idx = self.batch_scope.currentIndex()
         self.batch_start.setEnabled(idx == 1)
         self.batch_end.setEnabled(idx == 1)
@@ -3187,7 +3387,6 @@ class FOGSignalAnalyzer(QMainWindow):
             self.batch_summary.setText('CONFIG: ' + str(exc))
 
     def _copy_analysis_to_batch(self):
-        self._restore_feature_options('batch',{'feature_options':self._get_feature_options('analysis')})
         if not hasattr(self, 'resample_checkbox'):
             return
         for name, w in self.batch_controls.items():
@@ -3208,11 +3407,12 @@ class FOGSignalAnalyzer(QMainWindow):
         self.batch_start.setValue(self.selection_start.value())
         self.batch_end.setValue(self.selection_end.value())
         self.batch_exclude_zero.setChecked(self.selection_exclude.isChecked())
+        self._restore_feature_options('batch', {'feature_options': self._get_feature_options('analysis')})
+        self._update_feature_availability('batch')
         self._batch_changed()
 
     def _set_batch_config(self, config):
         config = canonical_config(config)
-        self._restore_feature_options('batch',config)
         if config.get('schema') not in ('original-core-gui-v1','fog-unified-v1'):
             raise ValueError('Batch GUI này cần config original-core-gui-v1.')
         for name, w in self.batch_controls.items():
@@ -3239,6 +3439,8 @@ class FOGSignalAnalyzer(QMainWindow):
             w.setChecked(sensor in config['sensors'])
         for axis, w in self.batch_axis_checks.items():
             w.setChecked(axis in config['axes'])
+        self._restore_feature_options('batch', config)
+        self._update_feature_availability('batch')
         scope = config['selection']
         self.batch_scope.setCurrentIndex(scope['mode'])
         self.batch_start.setValue(scope['start'])

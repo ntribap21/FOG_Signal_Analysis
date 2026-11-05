@@ -9,7 +9,7 @@ from fractions import Fraction
 import numpy as np
 import pandas as pd
 from scipy import signal
-from feature_registry import BASE, GROUPS, options, axis_names, window_names, feature_names, axis_extra, window_extra, temporal_extra, wavelet_module
+from feature_registry import BASE, GROUPS, options, serialize_options, DWT_FEATURES, axis_names, window_names, feature_names, axis_extra, window_extra, temporal_extra, wavelet_module
 PIPELINE_VERSION = 'original14-unified-v1'
 GUI_SENSORS = ('Ankle','Thigh','Trunk')
 GUI_AXES = ('Forward','Vertical','Lateral')
@@ -502,13 +502,20 @@ def _canonicalize_dict(config):
     result['schema']='fog-unified-v1'
     result['feature_version'] = 'original14-welch64-bandfix-v2'
     fo=options(result)
-    if any(fo[k] for k in GROUPS) or fo['base_features']!=BASE:
-        result['feature_options']={k:v for k,v in fo.items() if k!='cwt' or v}
-        result['feature_version']='selected-extended-v2'
-        result['feature_names']=feature_names(result)
-        result['undefined_feature_policy']='nan; train-fold median imputation with indicators; empty features -> 0'
+    has_individual_selection = (
+        fo['axis_features'] != BASE
+        or any(bool(values) for values in fo['window_features'].values())
+    )
+    # Keep legacy default config compact, but persist explicit selections (and CFS)
+    # so GUI, batch, NPZ/CSV and trainer all receive the exact same feature schema.
+    if has_individual_selection or fo['cfs']:
+        result['feature_options'] = serialize_options(fo)
+        result['feature_version'] = 'selected-individual-features-v3'
+        result['feature_names'] = feature_names(result)
+        result['undefined_feature_policy'] = 'nan; train-fold median imputation with indicators; empty features -> 0'
     else:
-        for key in ['feature_options','feature_names','undefined_feature_policy']: result.pop(key,None)
+        for key in ['feature_options','feature_names','undefined_feature_policy']:
+            result.pop(key, None)
 
     if fo['cwt']:
         from cwt_features import settings as cwt_settings
@@ -517,6 +524,19 @@ def _canonicalize_dict(config):
         result.pop('cwt_settings',None)
     if not feature_names(result): raise ValueError('Cần chọn ít nhất một đặc trưng.')
     if fo['wavelet']:
+        selected_dwt = set(fo['axis_features']).intersection(DWT_FEATURES)
+        requested_levels = [
+            int(match.group(1))
+            for name in selected_dwt
+            if (match := re.match(r'Wavelet_D(\d+)_', name))
+        ]
+        if 'Wavelet_D3_D4_Energy_Ratio' in selected_dwt and fo['wavelet_level'] < 4:
+            raise ValueError('Wavelet_D3_D4_Energy_Ratio cần DWT level >= 4.')
+        if requested_levels and max(requested_levels) > fo['wavelet_level']:
+            raise ValueError(
+                f'Đã chọn Wavelet D{max(requested_levels)} nhưng DWT level hiện tại là '
+                f'{fo["wavelet_level"]}. Hãy tăng DWT level hoặc bỏ chọn feature đó.'
+            )
         pywt=wavelet_module();wavelet=pywt.Wavelet(fo['wavelet_name']);n=int(round(c['window_length_spinbox']*fs))
         maximum=pywt.dwt_max_level(n,wavelet.dec_len)
         if fo['wavelet_level']>maximum: raise ValueError(f'{n} mẫu: {wavelet.name} chỉ hỗ trợ mức hữu ích <= {maximum}. Giảm DWT level hoặc tăng window.')
