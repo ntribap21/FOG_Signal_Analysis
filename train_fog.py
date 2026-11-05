@@ -433,12 +433,12 @@ class CFSSelector(BaseEstimator, TransformerMixin):
                 stagnation = 0
             else:
                 stagnation += 1
-                if stagnation >= self.min_backtrack:
+                if int(self.max_features or 30) <= 30 and stagnation >= self.min_backtrack:
                     break
-
-        if not best_selected:
-            best_selected = [int(np.argmax(r_cf))]
-        self.selected_indices_ = np.sort(np.asarray(best_selected, dtype=int))
+        chosen_subset = selected if int(self.max_features or 30) > 30 else best_selected
+        if not chosen_subset:
+            chosen_subset = [int(np.argmax(r_cf))]
+        self.selected_indices_ = np.sort(np.asarray(chosen_subset, dtype=int))
         self.support_mask_ = np.zeros(n_features, dtype=bool)
         self.support_mask_[self.selected_indices_] = True
         self.best_merit_ = float(best_merit)

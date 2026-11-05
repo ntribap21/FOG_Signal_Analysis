@@ -7,6 +7,7 @@ New configurations use:
 """
 import numpy as np
 from scipy import signal, stats
+from scipy.integrate import trapezoid as _trapezoid
 
 RELEASE_VERSION = 'fog-unified-1.4-cwt'
 
@@ -590,8 +591,9 @@ def axis_extra(x, fs, config):
             out.update({f'AR_{i}': ar_coeffs[i - 1] for i in range(1, 13) if f'AR_{i}' in rod_selected})
 
         if 'Integrals' in rod_selected:
-            integ_fn = getattr(np, 'trapezoid', np.trapz)
-            out['Integrals'] = float(integ_fn(np.abs(xc), dx=1.0 / fs))
+            out['Integrals'] = float(
+            _trapezoid(np.abs(xc), dx=1.0 / fs)
+        )
 
     return out
 
@@ -764,9 +766,9 @@ def band_power(f, p, lo, hi):
     mask = (f >= lo) & (f <= hi)
     if mask.sum() < 2:
         return 0.0
-    if hasattr(np, 'trapezoid'):
-        return float(np.trapezoid(p[mask], f[mask]))
-    return float(np.trapz(p[mask], f[mask]))
+    return float(
+    _trapezoid(p[mask], x=f[mask])
+    )
 
 
 def temporal_extra(history, current, start, config, fs):

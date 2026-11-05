@@ -9,6 +9,10 @@ from fractions import Fraction
 import numpy as np
 import pandas as pd
 from scipy import signal
+try:
+    from scipy.integrate import trapezoid as _trapezoid_integral
+except ImportError:
+    _trapezoid_integral = np.trapz
 from feature_registry import BASE, GROUPS, options, serialize_options, DWT_FEATURES, axis_names, window_names, feature_names, axis_extra, window_extra, temporal_extra, wavelet_module
 PIPELINE_VERSION = 'original14-unified-v1'
 GUI_SENSORS = ('Ankle','Thigh','Trunk')
@@ -321,7 +325,7 @@ class ProcessingEngine:
             xc,fs=fs, window="hann",
             nperseg=nperseg, noverlap=noverlap, nfft=nfft,
             detrend=False, scaling="density")
-        integ=lambda y,z: float(np.trapezoid(y,z) if hasattr(np,"trapezoid") else np.trapezoid(y,z)) if len(y)>1 else 0.0
+        integ = lambda y, z: ( float(_trapezoid_integral(y, x=z)) if len(y) > 1 else 0.0)
         total=integ(pp,pf); 
         lm=(pf >= 0.5) & (pf <= 3.0); 
         fm=(pf >= 3.0) & (pf <= 8.0); 

@@ -2593,8 +2593,9 @@ class FOGSignalAnalyzer(QMainWindow):
 
     def _update_feature_availability(self, scope):
         """Disable feature choices whose sensor/axis requirements are not met."""
-        axis_checks = getattr(self, scope + '_window_feature_checks', {})
-        if not axis_checks:
+        window_checks = getattr(self, scope + '_window_feature_checks', {})
+        axis_checks = getattr(self, scope + '_axis_feature_checks', {})
+        if not window_checks and not axis_checks:
             return
 
         if scope == 'analysis':
@@ -2630,7 +2631,6 @@ class FOGSignalAnalyzer(QMainWindow):
         params = getattr(self, scope + '_feature_params', {})
         level_widget = params.get('wavelet_level')
         wavelet_level = level_widget.value() if level_widget is not None else 4
-        axis_checks = getattr(self, scope + '_axis_feature_checks', {})
         for feature, widget in axis_checks.items():
             if feature == 'Wavelet_D3_D4_Energy_Ratio':
                 available = wavelet_level >= 4
@@ -2667,7 +2667,7 @@ class FOGSignalAnalyzer(QMainWindow):
             'rodriguez_window': (all_axes, 'PCA / Rodriguez multi-axis cần đủ ba trục.'),
         }
 
-        for group, checks in axis_checks.items():
+        for group, checks in window_checks.items():
             if group == 'corr':
                 for feature, widget in checks.items():
                     axes_pair = feature.removeprefix('Corr_').split('_', 1)
