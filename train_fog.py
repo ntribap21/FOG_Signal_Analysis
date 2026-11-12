@@ -893,7 +893,13 @@ def select_joint_parameters(pipeline, X, y, groups, *, tune=False, threshold_tun
         _loso_options(kernel, c, gamma_values[0], 512.0, decision_threshold, min_sensitivity, min_specificity, n_jobs)
     for g in gamma_values:
         _loso_options(kernel, c_values[0], g, 512.0, decision_threshold, min_sensitivity, min_specificity, n_jobs)
-    params_list = [{'svm__C': float(c), 'svm__gamma': g} for c in dict.fromkeys(c_values) for g in dict.fromkeys(gamma_values)]
+    median_values = [1, 3, 5, 7, 9, 11, 15] if tune else [int(median_filter)]
+    params_list = [
+        {'svm__C': float(c), 'svm__gamma': g, 'median_k': k} 
+        for c in dict.fromkeys(c_values) 
+        for g in dict.fromkeys(gamma_values)
+        for k in dict.fromkeys(median_values)
+    ]
     fold_ids = np.full(len(y), -1, dtype=int)
     fold_rows = []
     for fold, (a, b) in enumerate(folds, 1):
@@ -923,13 +929,16 @@ def select_joint_parameters(pipeline, X, y, groups, *, tune=False, threshold_tun
 
     candidate_rows, sweeps = ([], [])
     for i, (params, scores) in enumerate(zip(params_list, all_scores), 1):
+        current_median_k = params['median_k']
+        svm_params = {'svm__C': params['svm__C'], 'svm__gamma': params['svm__gamma']}
         if threshold_tuning:
             sweep, selected = sweep_validation_thresholds(
                 y, scores,
                 min_sensitivity=min_sensitivity, min_specificity=min_specificity,
                 method=threshold_method, threshold_min=threshold_min,
                 threshold_max=threshold_max, threshold_step=threshold_step,
-                manifest_subset=manifest_subset, median_filter=median_filter,
+                manifest_subset=manifest_subset, 
+                median_filter=current_median_k, # SỬ DỤNG K CỦA CANDIDATE NÀY
             )
             if selected is not None:
                 row = sweep.loc[sweep.Decision_Threshold == selected].iloc[0]
@@ -962,9 +971,9 @@ def select_joint_parameters(pipeline, X, y, groups, *, tune=False, threshold_tun
             sweep = pd.DataFrame([record])
 
         # Bước 3 & Bước 4: Tính Sensitivity, Specificity trên từng inner validation fold (đã lọc trung vị) -> lấy trung bình -> tính GM
-        fold_gm_info = _inner_fold_gm_stats(y, scores, folds, record['Decision_Threshold'], manifest_subset=manifest_subset, median_filter=median_filter)
+        fold_gm_info = _inner_fold_gm_stats(y, scores, folds, record['Decision_Threshold'], manifest_subset=manifest_subset, median_filter=current_median_k)
         record.update(fold_gm_info)
-        record.update(Candidate_ID=i, C=params['svm__C'], Gamma=params['svm__gamma'], Median_Filter_Window=int(median_filter))
+        record.update(Candidate_ID=i, C=params['svm__C'], Gamma=params['svm__gamma'], Median_Filter_Window=current_median_k)
         candidate_rows.append(record)
         sweeps.append(sweep)
         if output is not None and save_all_sweeps:
@@ -1003,7 +1012,7 @@ def select_joint_parameters(pipeline, X, y, groups, *, tune=False, threshold_tun
         'C': float(chosen.C),
         'gamma': chosen.Gamma,
         'decision_threshold': float(chosen.Decision_Threshold),
-        'median_filter_window': int(median_filter),
+        'median_filter_window': int(chosen.Median_Filter_Window),
         'selection_metric': selection_metric,
         'inner_fold_mean_sensitivity': float(chosen.Inner_Fold_Mean_Sensitivity),
         'inner_fold_mean_specificity': float(chosen.Inner_Fold_Mean_Specificity),
@@ -1129,6 +1138,7 @@ def train_loso(
         'cfs_max_features': int(cfs_max_features) if cfs else None,
         'median_filter_window': int(median_filter),
         'median_filter_boundary_mode': 'nearest',
+        'median_filter_grid': [1, 3, 5, 7, 9, 11, 15] if tune else [int(median_filter)],
         'cache_size': cache_size,
         'n_jobs': n_jobs,
         'versions': {'sklearn': sklearn.__version__, 'numpy': np.__version__, 'pandas': pd.__version__},
