@@ -1,0 +1,65 @@
+{
+  "model_type": "svm",
+  "model_name": "Weighted SVM",
+  "score_units": "SVM decision score",
+  "evaluation": "loso",
+  "trainer_version": "fog-unified-v3-svm-loso-2level-1",
+  "outer_folds": 10,
+  "inner_cv": "SGKF",
+  "inner_cv_folds": 3,
+  "cv_levels": 2,
+  "tune": true,
+  "threshold_tuning": true,
+  "selection_metric": "gm",
+  "seed": 42,
+  "threshold_method": "grid",
+  "kernel": "rbf",
+  "fixed_C": 1.0,
+  "fixed_gamma": "scale",
+  "fixed_decision_threshold": 0.0,
+  "class_weight": "balanced",
+  "fog_weight_ratio": null,
+  "cfs": true,
+  "cfs_max_features": 55,
+  "median_filter_window": 1,
+  "median_filter_boundary_mode": "nearest",
+  "median_filter_grid": [
+    1,
+    3,
+    5,
+    7,
+    9,
+    11,
+    15
+  ],
+  "cache_size": 512.0,
+  "n_jobs": -1,
+  "versions": {
+    "sklearn": "1.9.1",
+    "numpy": "2.5.2",
+    "pandas": "2.3.3"
+  },
+  "fallback_policy": "best inner gm when both targets cannot be met",
+  "n_features": 698,
+  "input_files": [
+    "E:\\TEEP\\FOG_Research\\fog_batch.npz"
+  ],
+  "C_grid": [
+    0.1,
+    1.0,
+    10.0,
+    100.0
+  ],
+  "gamma_grid": [
+    "scale",
+    0.01,
+    0.1
+  ],
+  "min_sensitivity": 0.85,
+  "min_specificity": 0.85,
+  "threshold_grid": {
+    "min": -0.15,
+    "max": 0.5,
+    "step": 0.02
+  }
+}

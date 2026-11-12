@@ -49,11 +49,13 @@ class FoldInfo:
     geometric_mean: float | None
     balanced_accuracy: float | None
     fog_f1: float | None
-    c_val: float | None
-    gamma_val: str | float | None
-    threshold: float | None
-    inner_gm_fold_mean: float | None
-    inner_gm_pooled: float | None
+    ppv: float | None = None
+    roc_auc: float | None = None
+    c_val: float | None = None
+    gamma_val: str | float | None = None
+    threshold: float | None = None
+    inner_gm_fold_mean: float | None = None
+    inner_gm_pooled: float | None = None
     cfs_enabled: bool = False
     cfs_features: list = field(default_factory=list)
 
@@ -211,6 +213,7 @@ def load_runs(path):
                 sel_params = fm.get('selected_parameters') or {}
                 cfs_list = fm.get('cfs_selected_features')
                 cfs_enabled = bool(fm.get('cfs_enabled') or settings.get('cfs') or (isinstance(cfs_list, list) and len(cfs_list) > 0))
+                
                 fold_infos.append(FoldInfo(
                     fold_name=fold_dir,
                     subject=subj,
@@ -219,6 +222,8 @@ def load_runs(path):
                     geometric_mean=gm_val,
                     balanced_accuracy=bacc,
                     fog_f1=_safe_float(fm.get('fog_f1')),
+                    ppv=_safe_float(fm.get('ppv')),
+                    roc_auc=_safe_float(fm.get('roc_auc')),
                     c_val=_safe_float(sel_params.get('C')),
                     gamma_val=sel_params.get('gamma'),
                     threshold=_safe_float(fm.get('decision_threshold', sel_params.get('decision_threshold'))),
@@ -744,7 +749,99 @@ class MainWindow(QMainWindow):
         self.create_gm_tab()
         self.create_cfs_tab()
         self.create_shap_tab()
+        self.create_subject_metrics_tab() # GỌI TAB MỚI TẠI ĐÂY
         self.refresh()
+
+    def create_subject_metrics_tab(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        controls = QHBoxLayout()
+
+        self.subj_run_combo = QComboBox()
+        controls.addWidget(QLabel('Chọn kết quả:'))
+        controls.addWidget(self.subj_run_combo, 1)
+        layout.addLayout(controls)
+
+        self.subj_note = QLabel()
+        self.subj_note.setWordWrap(True)
+        self.subj_note.setStyleSheet('color:#4c1d95;padding:6px;background:#ede9fe;border-radius:4px')
+        layout.addWidget(self.subj_note)
+
+        self.subj_table = QTableWidget()
+        self.subj_table.setAlternatingRowColors(True)
+        self.subj_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        layout.addWidget(self.subj_table, 1)
+
+        self.tabs.addTab(page, 'Chỉ số Bệnh nhân')
+        self.subj_run_combo.currentIndexChanged.connect(self.draw_subject_metrics)
+
+    def draw_subject_metrics(self, *_):
+        runs = getattr(self, '_active_runs', [])
+        idx = self.subj_run_combo.currentIndex()
+        run = runs[idx] if 0 <= idx < len(runs) else None
+
+        if not run:
+            self.subj_note.setText('Thêm kết quả train để xem chi tiết chỉ số từng bệnh nhân.')
+            self.subj_table.setRowCount(0)
+            return
+
+        # Tìm model có GM tổng cao nhất trong các run đã nạp để gợi ý Median tối ưu
+        best_run = None
+        max_gm = -1
+        for r in runs:
+            gm = r.values.get('geometric_mean', -1)
+            if math.isfinite(gm) and gm > max_gm:
+                max_gm = gm
+                best_run = r
+
+        best_med = "N/A"
+        if best_run:
+            med_val = best_run.settings.get('median_filter_window') or (best_run.settings.get('versions') or {}).get('median_filter')
+            best_med = str(med_val) if med_val else "Không dùng"
+
+        curr_med = run.settings.get('median_filter_window') or (run.settings.get('versions') or {}).get('median_filter')
+        curr_med_str = str(curr_med) if curr_med else "Không dùng"
+
+        self.subj_note.setText(
+            f"Đang xem: {run.name} (Median filter: {curr_med_str}).\n"
+            f"Tối ưu nhất hiện tại (trong danh sách đã nạp): {best_run.name if best_run else ''} "
+            f"với Median filter = {best_med} (GM chung = {max_gm*100:.2f}%)."
+        )
+
+        headers = ['Subject', 'Sensitivity (%)', 'Specificity (%)', 'PPV (%)', 'F1-Score (%)', 'ROC-AUC']
+        self.subj_table.setSortingEnabled(False)
+        self.subj_table.setRowCount(len(run.fold_infos))
+        self.subj_table.setColumnCount(len(headers))
+        self.subj_table.setHorizontalHeaderLabels(headers)
+
+        for i, fi in enumerate(run.fold_infos):
+            # Format: (giá_trị, nhân_hệ_số, là_chuỗi_chữ)
+            row_data = [
+                (fi.subject, None, True),
+                (fi.sensitivity, 100, False),
+                (fi.specificity, 100, False),
+                (fi.ppv, 100, False),
+                (fi.fog_f1, 100, False),
+                (fi.roc_auc, 1, False) # AUC thường để hệ số 0-1
+            ]
+            
+            for j, (val, multiplier, is_string) in enumerate(row_data):
+                if is_string:
+                    item = NumericItem(str(val))
+                    item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+                else:
+                    if val is not None and math.isfinite(val):
+                        num = val * multiplier
+                        text = f"{num:.2f}" if multiplier == 100 else f"{num:.4f}"
+                        item = NumericItem(text, num)
+                    else:
+                        item = NumericItem("N/A")
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.subj_table.setItem(i, j, item)
+
+        self.subj_table.resizeColumnsToContents()
+        self.subj_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.subj_table.setSortingEnabled(True)
 
     def create_gm_tab(self):
         page = QWidget()
@@ -1012,7 +1109,7 @@ class MainWindow(QMainWindow):
 
     def refresh_gm_and_cfs_runs(self, runs):
         self._active_runs = runs
-        for combo in (self.gmrun, self.cfsrun):
+        for combo in (self.gmrun, self.cfsrun, self.subj_run_combo): 
             old = combo.currentData()
             combo.blockSignals(True)
             combo.clear()
@@ -1024,7 +1121,9 @@ class MainWindow(QMainWindow):
             combo.blockSignals(False)
         self.draw_gm()
         self.cfs_run_changed()
+        self.draw_subject_metrics() 
 
+    # --- THÊM PHƯƠNG THỨC DRAW_GM VÀO ĐÂY ---
     def draw_gm(self, *_):
         runs = getattr(self, '_active_runs', [])
         if not runs:
