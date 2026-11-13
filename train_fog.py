@@ -894,12 +894,7 @@ def select_joint_parameters(pipeline, X, y, groups, *, tune=False, threshold_tun
     for g in gamma_values:
         _loso_options(kernel, c_values[0], g, 512.0, decision_threshold, min_sensitivity, min_specificity, n_jobs)
     median_values = [1, 3, 5, 7, 9, 11, 15] if tune else [int(median_filter)]
-    params_list = [
-        {'svm__C': float(c), 'svm__gamma': g, 'median_k': k} 
-        for c in dict.fromkeys(c_values) 
-        for g in dict.fromkeys(gamma_values)
-        for k in dict.fromkeys(median_values)
-    ]
+    params_list = [{'svm__C': float(c), 'svm__gamma': g} for c in dict.fromkeys(c_values) for g in dict.fromkeys(gamma_values)]
     fold_ids = np.full(len(y), -1, dtype=int)
     fold_rows = []
     for fold, (a, b) in enumerate(folds, 1):
@@ -928,58 +923,76 @@ def select_joint_parameters(pipeline, X, y, groups, *, tune=False, threshold_tun
         )
 
     candidate_rows, sweeps = ([], [])
-    for i, (params, scores) in enumerate(zip(params_list, all_scores), 1):
-        current_median_k = params['median_k']
-        svm_params = {'svm__C': params['svm__C'], 'svm__gamma': params['svm__gamma']}
-        if threshold_tuning:
-            sweep, selected = sweep_validation_thresholds(
-                y, scores,
-                min_sensitivity=min_sensitivity, min_specificity=min_specificity,
-                method=threshold_method, threshold_min=threshold_min,
-                threshold_max=threshold_max, threshold_step=threshold_step,
-                manifest_subset=manifest_subset, 
-                median_filter=current_median_k, # SỬ DỤNG K CỦA CANDIDATE NÀY
-            )
-            if selected is not None:
-                row = sweep.loc[sweep.Decision_Threshold == selected].iloc[0]
-            elif selection_metric == 'gm':
-                row = sweep.sort_values(['Geometric_Mean', 'Balanced_Accuracy', 'F1_FOG', 'Decision_Threshold'], ascending=[False, False, False, False]).iloc[0]
+    median_values = [1, 3, 5, 7, 9, 11, 15] if tune else [int(median_filter)]
+    candidate_id = 1 
+    
+    for score_idx, (params, scores) in enumerate(zip(params_list, all_scores)):
+        for current_median in median_values:
+            
+            # TÍNH TOÁN NGƯỠNG TRƯỚC ĐỂ SINH RA BIẾN 'record'
+            if threshold_tuning:
+                sweep, selected = sweep_validation_thresholds(
+                    y, scores,
+                    min_sensitivity=min_sensitivity, min_specificity=min_specificity,
+                    method=threshold_method, threshold_min=threshold_min,
+                    threshold_max=threshold_max, threshold_step=threshold_step,
+                    manifest_subset=manifest_subset, 
+                    median_filter=current_median,
+                )
+                if selected is not None:
+                    row = sweep.loc[sweep.Decision_Threshold == selected].iloc[0]
+                elif selection_metric == 'gm':
+                    row = sweep.sort_values(['Geometric_Mean', 'Balanced_Accuracy', 'F1_FOG', 'Decision_Threshold'], ascending=[False, False, False, False]).iloc[0]
+                else:
+                    row = sweep.sort_values(['Balanced_Accuracy', 'F1_FOG', 'Specificity', 'Decision_Threshold'], ascending=[False, False, False, False]).iloc[0]
+                record = {k: row[k].item() if hasattr(row[k], 'item') else row[k] for k in sweep.columns}
+                record['Target_Met'] = selected is not None
+                record['Threshold_Role'] = 'target_met' if selected is not None else f'fallback_best_{selection_metric}'
             else:
-                row = sweep.sort_values(['Balanced_Accuracy', 'F1_FOG', 'Specificity', 'Decision_Threshold'], ascending=[False, False, False, False]).iloc[0]
-            record = {k: row[k].item() if hasattr(row[k], 'item') else row[k] for k in sweep.columns}
-            record['Target_Met'] = selected is not None
-            record['Threshold_Role'] = 'target_met' if selected is not None else f'fallback_best_{selection_metric}'
-        else:
-            raw_pred = (scores > decision_threshold).astype(np.int8)
-            pred = apply_median_postprocessing(manifest_subset, raw_pred, median_filter) if manifest_subset is not None else raw_pred
-            result = diagnostic_metrics(y, pred)
-            record = {
-                'Decision_Threshold': float(decision_threshold),
-                'Sensitivity': result['sensitivity'],
-                'Specificity': result['specificity'],
-                'Geometric_Mean': result['geometric_mean'],
-                'Accuracy': result['accuracy'],
-                'PPV': result['ppv'],
-                'NPV': result['npv'],
-                'F1_FOG': float(f1_score(y, pred, zero_division=0)),
-                'Balanced_Accuracy': (result['sensitivity'] + result['specificity']) / 2,
-                'Youden_Index': result['youden_index'],
-                **result['confusion_counts'],
-                'Target_Met': None,
-                'Threshold_Role': 'fixed_threshold',
-            }
-            sweep = pd.DataFrame([record])
+                raw_pred = (scores > decision_threshold).astype(np.int8)
+                pred = apply_median_postprocessing(manifest_subset, raw_pred, current_median) if manifest_subset is not None else raw_pred
+                result = diagnostic_metrics(y, pred)
+                record = {
+                    'Decision_Threshold': float(decision_threshold),
+                    'Sensitivity': result['sensitivity'],
+                    'Specificity': result['specificity'],
+                    'Geometric_Mean': result['geometric_mean'],
+                    'Accuracy': result['accuracy'],
+                    'PPV': result['ppv'],
+                    'NPV': result['npv'],
+                    'F1_FOG': float(f1_score(y, pred, zero_division=0)),
+                    'Balanced_Accuracy': (result['sensitivity'] + result['specificity']) / 2,
+                    'Youden_Index': result['youden_index'],
+                    **result['confusion_counts'],
+                    'Target_Met': None,
+                    'Threshold_Role': 'fixed_threshold',
+                }
+                sweep = pd.DataFrame([record])
 
-        # Bước 3 & Bước 4: Tính Sensitivity, Specificity trên từng inner validation fold (đã lọc trung vị) -> lấy trung bình -> tính GM
-        fold_gm_info = _inner_fold_gm_stats(y, scores, folds, record['Decision_Threshold'], manifest_subset=manifest_subset, median_filter=current_median_k)
-        record.update(fold_gm_info)
-        record.update(Candidate_ID=i, C=params['svm__C'], Gamma=params['svm__gamma'], Median_Filter_Window=current_median_k)
-        candidate_rows.append(record)
-        sweeps.append(sweep)
-        if output is not None and save_all_sweeps:
-            directory = Path(output) / 'candidate_threshold_sweeps'
-            directory.mkdir(exist_ok=True)
-            sweep.to_csv(directory / f'candidate_{i:02d}.csv', index=False)
+            # SAU KHI CÓ RECORD, MỚI COPY VÀ CẬP NHẬT CÁC CHỈ SỐ BỔ SUNG
+            record_copy = record.copy()
+            
+            fold_gm_info = _inner_fold_gm_stats(
+                y, scores, folds, record_copy['Decision_Threshold'], 
+                manifest_subset=manifest_subset, median_filter=current_median
+            )
+            record_copy.update(fold_gm_info)
+            record_copy.update(
+                Candidate_ID=candidate_id, 
+                Score_Index=score_idx, 
+                C=params['svm__C'], 
+                Gamma=params['svm__gamma'], 
+                Median_Filter_Window=current_median
+            )
+            
+            candidate_rows.append(record_copy)
+            sweeps.append(sweep)
+            if output is not None and save_all_sweeps:
+                directory = Path(output) / 'candidate_threshold_sweeps'
+                directory.mkdir(exist_ok=True)
+                sweep.to_csv(directory / f'candidate_{candidate_id:02d}.csv', index=False)
+            
+            candidate_id += 1
 
     candidates = pd.DataFrame(candidate_rows)
 
@@ -1007,6 +1020,7 @@ def select_joint_parameters(pipeline, X, y, groups, *, tune=False, threshold_tun
             selection_rule = 'max pooled inner OOF F1 at fixed threshold; ties: specificity, candidate order'
 
     chosen_id = int(chosen.Candidate_ID)
+    chosen_score_idx = int(chosen.Score_Index)
     summary = {
         'candidate_id': chosen_id,
         'C': float(chosen.C),
@@ -1033,7 +1047,7 @@ def select_joint_parameters(pipeline, X, y, groups, *, tune=False, threshold_tun
         sweeps[chosen_id - 1].to_csv(Path(output) / 'selected_candidate_threshold_sweep.csv', index=False)
         pd.DataFrame(fold_rows).to_csv(Path(output) / 'inner_folds.csv', index=False)
         _write_json(Path(output) / 'selected_parameters.json', summary)
-    return (summary, all_scores[chosen_id - 1], fold_ids)
+    return (summary, all_scores[chosen_score_idx], fold_ids)
 
 def _outer_metrics(y, prediction, scores=None):
     result = diagnostic_metrics(y, prediction)
@@ -1235,7 +1249,15 @@ def train_loso(
         scores = model.decision_function(X[test_idx])
         threshold = selected['decision_threshold']
         raw_predicted = (scores > threshold).astype(np.int8)
-        predicted = apply_median_postprocessing(manifest.iloc[test_idx], raw_predicted, median_filter)
+        # Bước 6: Train lại bằng toàn bộ outer training subjects với cặp (C, gamma) đã chọn, rồi đánh giá trên outer test
+        model = clone(pipeline).set_params(svm__C=selected['C'], svm__gamma=selected['gamma'])
+        model.fit(X[train_idx], y[train_idx])
+        scores = model.decision_function(X[test_idx])
+        threshold = selected['decision_threshold']
+        best_median = selected['median_filter_window']
+        
+        raw_predicted = (scores > threshold).astype(np.int8)
+        predicted = apply_median_postprocessing(manifest.iloc[test_idx], raw_predicted, best_median)
 
         cfs_selected_features = None
         if cfs and 'cfs' in model.named_steps:
