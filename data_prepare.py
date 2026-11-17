@@ -10,11 +10,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from signal_processing import Config,prepare_recording,recording_id,merge_configs,GUI_SENSORS,GUI_AXES
-
+from signal_processing import FOG_STAR_SIGNAL_COLS
 from feature_registry import feature_names, axis_names, window_names
 
 FEATURES=['Mean','RMS','Std','Variance','Min','Max','SMA','Dominant_Frequency','Total_Power','Loco_Power','Freeze_Power','Freeze_Index','Low_Freq_Ratio','PSE']
-
 
 def discover_inputs(inputs):
     paths=[]
@@ -106,6 +105,34 @@ def gui_export(table,config,prefix,format_index,report=None):
     config=Config.from_dict(config);wide,names=wide_from_gui(table,config)
     return export_dataset(wide,names,config,prefix,['both','npz','csv'][format_index],report)
 
+def extract_features_for_profile(windows_data, windows_meta, fs, profile_name, engine):
+    if profile_name == 'FOG_STAR':
+        channel_map = {col: col for col in FOG_STAR_SIGNAL_COLS} 
+        scale_factor = 1.0
+    else:
+        # Daphnet: 
+        channel_map = {
+            f'{s}_{a}_mg': f'{s}_{a}'
+            for s in ('Ankle', 'Thigh', 'Trunk')
+            for a in ('Forward', 'Vertical', 'Lateral')
+        }
+        scale_factor = 1.0 / 1000.0
+
+    rows = []
+    for win_df, meta in zip(windows_data, windows_meta):
+        row = dict(meta)
+        for raw_col, feat_prefix in channel_map.items():
+            sig = win_df[raw_col].to_numpy(dtype=float) * scale_factor
+            feats = engine._compute_features(sig, fs)
+            for f_name in ('Mean', 'RMS', 'Std', 'Variance', 'Min', 'Max', 'SMA',
+                           'Dominant Frequency', 'Total Power', 'Loco Power',
+                           'Freeze Power', 'Freeze Index', 'Low Freq Ratio', 'PSE'):
+                col_key = f"{feat_prefix}_{f_name.replace(' ', '_')}"
+                row[col_key] = float(feats[f_name])
+        rows.append(row)
+
+    feature_df = pd.DataFrame(rows)
+    return feature_df
 
 def main():
     p=argparse.ArgumentParser(description='Unified DAPHNET preparation: original numerical algorithms.')
