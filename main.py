@@ -2940,28 +2940,44 @@ class FOGSignalAnalyzer(QMainWindow):
         scroll.setWidgetResizable(True)
         body = QWidget()
         bl = QVBoxLayout(body)
-        channel_group = QGroupBox('VỊ TRÍ CẢM BIẾN VÀ TRỤC')
+        channel_group = QGroupBox('Sensor placement VÀ Axis')
         cg = QGridLayout(channel_group)
         self.batch_sensor_checks = {}
         self.batch_axis_checks = {}
-        cg.addWidget(QLabel('Vị trí (1–3 cảm biến)'), 0, 0)
-        for idx_s, sensor in enumerate(GUI_SENSORS):
+
+        # Nút chọn nhanh bộ cảm biến để không phải tích tay từng ô
+        btn_sel_daphnet = self._button('CHỌN BỘ DAPHNET (3)', lambda: self._select_batch_sensor_preset('DAPHNET'))
+        btn_sel_fogstar = self._button('CHỌN BỘ FoG-STAR (8)', lambda: self._select_batch_sensor_preset('FOG_STAR'))
+        cg.addWidget(QLabel('Chọn nhanh:'), 0, 0)
+        cg.addWidget(btn_sel_daphnet, 0, 1, 1, 2)
+        cg.addWidget(btn_sel_fogstar, 0, 3, 1, 2)
+
+        # Hàng 1: 3 cảm biến DAPHNET
+        cg.addWidget(QLabel('DAPHNET (64Hz):'), 1, 0)
+        for col, sensor in enumerate(DAPHNET_SENSORS, 1):
             check = QCheckBox(sensor)
-            check.setChecked(sensor == 'Ankle')
+            check.setChecked(False)
             self.batch_sensor_checks[sensor] = check
-            cg.addWidget(check, idx_s // 4, (idx_s % 4) + 1)
-        cg.addWidget(QLabel('Trục (1–3 mỗi cảm biến)'), 3, 0)
-        for col, axis in enumerate(GUI_AXES, 1):
-            check = QCheckBox(axis)
-            check.setChecked(True)
-            self.batch_axis_checks[axis] = check
-            cg.addWidget(check, 3, col)
-        cg.addWidget(QLabel('Trục (1–3 mỗi cảm biến)'), 1, 0)
-        for col, axis in enumerate(GUI_AXES, 1):
-            check = QCheckBox(axis)
-            check.setChecked(True)
-            self.batch_axis_checks[axis] = check
             cg.addWidget(check, 1, col)
+
+        # Hàng 2 & 3: 8 cảm biến FoG-STAR (Acc + Gyro)
+        cg.addWidget(QLabel('FoG-STAR (60Hz):'), 2, 0)
+        for idx_s, sensor in enumerate(FOG_STAR_SENSORS):
+            check = QCheckBox(sensor)
+            check.setChecked(True)  # Mặc định tích sẵn đủ 8 cảm biến FoG-STAR
+            self.batch_sensor_checks[sensor] = check
+            cg.addWidget(check, 2 + (idx_s // 4), (idx_s % 4) + 1)
+
+        # Hàng 4: 3 trục (đẩy xuống hàng 4 để không đè lên cảm biến)
+        cg.addWidget(QLabel('Trục (1–3 mỗi cảm biến):'), 4, 0)
+        for col, axis in enumerate(GUI_AXES, 1):
+            check = QCheckBox(axis)
+            check.setChecked(True)
+            self.batch_axis_checks[axis] = check
+            cg.addWidget(check, 4, col)
+
+        for col in (1, 2, 3, 4):
+            cg.setColumnStretch(col, 1)
         bl.addWidget(channel_group)
         scope_group = QGroupBox('DATA SELECTION CHUNG')
         sg = QGridLayout(scope_group)
@@ -3048,6 +3064,15 @@ class FOGSignalAnalyzer(QMainWindow):
             sig = w.toggled if isinstance(w, QCheckBox) else w.currentIndexChanged if isinstance(w, QComboBox) else w.valueChanged
             sig.connect(self._batch_changed)
         return page
+
+    def _select_batch_sensor_preset(self, preset):
+        target_set = set(DAPHNET_SENSORS if preset == 'DAPHNET' else FOG_STAR_SENSORS)
+        for sensor, check in self.batch_sensor_checks.items():
+            check.blockSignals(True)
+            check.setChecked(sensor in target_set)
+            check.blockSignals(False)
+        self.batch_controls['target_fs_spinbox'].setValue(64.0 if preset == 'DAPHNET' else 60.0)
+        self._batch_changed()
 
     def capture_config(self):
         config = self._capture_analysis_controls()
