@@ -2516,6 +2516,7 @@ class FOGSignalAnalyzer(QMainWindow):
             'autocorr_max_s': 'Autocorrelation maximum lag (s)',
             'crosscorr_max_s': 'Cross-correlation maximum lag (s)',
             'ater_epsilon_g2': 'ATER epsilon (g²)',
+            'apa_gravity_cutoff_hz': 'APA gravity low-pass cutoff (Hz)',
         }
         param_keys = [
             key for key in DEFAULTS
@@ -2543,14 +2544,17 @@ class FOGSignalAnalyzer(QMainWindow):
             else:
                 widget = QDoubleSpinBox()
                 widget.setDecimals(10 if key == 'ater_epsilon_g2' else 3)
-                widget.setRange(
-                    1e-10 if key == 'ater_epsilon_g2' else 0.001,
-                    1.0 if key in ('entropy_r_ratio', 'crosscorr_max_s') else 10.0
-                )
+                if key == 'apa_gravity_cutoff_hz':
+                    widget.setRange(0.1, 2.0)
+                    widget.setSingleStep(0.1)
+                elif key == 'ater_epsilon_g2':
+                    widget.setRange(1e-10, 10.0)
+                elif key in ('entropy_r_ratio', 'crosscorr_max_s'):
+                    widget.setRange(0.001, 1.0)
+                else:
+                    widget.setRange(0.001, 10.0)
                 widget.setValue(default)
-                widget.valueChanged.connect(
-                    lambda _=None, sc=scope: self._features_changed(sc)
-                )
+                widget.valueChanged.connect(lambda _=None, sc=scope: self._features_changed(sc))
             params[key] = widget
             settings_grid.addWidget(QLabel(labels.get(key, key)), i // 2, (i % 2) * 2)
             settings_grid.addWidget(widget, i // 2, (i % 2) * 2 + 1)
@@ -2665,6 +2669,8 @@ class FOGSignalAnalyzer(QMainWindow):
             ),
             'cwt': ('Forward' in axes, 'CWT cần chọn trục Forward.'),
             'rodriguez_window': (all_axes, 'PCA / Rodriguez multi-axis cần đủ ba trục.'),
+            'apa': ('Trunk' in all_sensors and all_axes,'APA cần cảm biến Trunk và đủ ba trục.'),
+            'sensor_fusion': ({'Ankle', 'Thigh', 'Trunk'}.issubset(all_sensors) and all_axes,'Sensor Fusion cần đủ Ankle, Thigh, Trunk và ba trục.'),
         }
 
         for group, checks in window_checks.items():
@@ -2762,7 +2768,11 @@ class FOGSignalAnalyzer(QMainWindow):
         records = list(window_feature_records(self.window_signal_data[start:idx + 1], self.window_metadata[start:idx + 1], float(self.windowing_sampling_rate), config))
         shared = records[-1][2]
         for key, value in shared.items():
-            if key.startswith(sensor + '_') or '_Corr_' in key:
+            if (
+                key.startswith(sensor + '_')
+                or '_Corr_' in key
+                or '_LogER_' in key
+            ):
                 display[key] = value
         self._show_extra_features(display)
         self.analysis_time_stats.setText(f'{len(axis_names(config))} selected axis features · {len(display)} additional/context values')
@@ -2789,6 +2799,17 @@ class FOGSignalAnalyzer(QMainWindow):
                 unit = 'g²'
             elif (normalized.startswith('Wavelet_') and normalized.endswith('_Std')) or 'Magnitude' in normalized or 'Delta_RMS' in normalized or 'Increments' in normalized or 'Diff_Inc_' in normalized:
                 unit = 'g'
+            elif normalized.endswith('_Slope_deg_s'):
+                unit = 'deg/s'
+
+            elif '_deg' in normalized:
+                unit = 'deg'
+
+            elif 'LogER' in normalized or 'Log_Freeze_Index' in normalized:
+                unit = '—'
+
+            elif normalized.endswith('_Loco_Power') or normalized.endswith('_Freeze_Power'):
+                unit = 'g²'
             else:
                 unit = '—'
             for col, text in enumerate([key, f'{value:.6g}' if np.isfinite(value) else 'N/A', unit]):

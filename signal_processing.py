@@ -396,7 +396,49 @@ def _select_scope(frame,config):
         mask &= (t>=scope['start'])&(t<=scope['end'])
     if scope['exclude_zero']:mask &= frame.Original_Label.isin([1,2]).to_numpy()
     return gui_split(frame.loc[mask],64.)
+def _append_trunk_posture_branch(frame, fs, config):
+    """
+    Tạo nhánh low-pass riêng để ước lượng thành phần trọng lực của Trunk.
+    Tín hiệu đầu vào và đầu ra đều giữ đơn vị mg.
+    """
 
+    fo = options(config)
+
+    if not fo['apa']:
+        return frame
+
+    cutoff = float(fo['apa_gravity_cutoff_hz'])
+
+    if not 0 < cutoff < fs / 2:
+        raise ValueError('APA gravity cutoff phải nhỏ hơn Nyquist.')
+
+    data = frame.copy()
+
+    sos = signal.butter(
+        2,
+        cutoff,
+        btype='lowpass',
+        fs=fs,
+        output='sos'
+    )
+
+    for axis in GUI_AXES:
+        source = f'Trunk_{axis}_mg'
+        target = f'Trunk_Posture_{axis}_mg'
+
+        values = data[source].to_numpy(dtype=float)
+
+        zi = signal.sosfilt_zi(sos) * values[0]
+
+        filtered, _ = signal.sosfilt(
+            sos,
+            values,
+            zi=zi
+        )
+
+        data[target] = filtered
+
+    return data
 def gui_process(runs,config):
     config=Config.from_dict(config)
     engine=ProcessingEngine(config);controls=config['controls'];fs=64.
@@ -405,6 +447,7 @@ def gui_process(runs,config):
     for sid,frame in runs:
         data=frame.copy()
         if controls['resample_checkbox']:data=engine.resample_dataframe(data,64.,fs)
+        if options(config)['apa']: data = _append_trunk_posture_branch(data, fs, config)
         if controls['filter_checkbox']:data=engine.apply_filter_to_dataframe(data,fs)
         if controls['detrend_checkbox']:data=engine.apply_detrend_to_dataframe(data)
         data=gui_labels(data);output.append((sid,data))
@@ -418,7 +461,15 @@ def gui_windows(runs,config,fs):
     step=max(1,int(round(size*(1-c['window_overlap_spinbox']/100))))
     axes=[a for a,flag in zip(GUI_AXES,['windowing_axis_x_checkbox','windowing_axis_y_checkbox','windowing_axis_z_checkbox']) if c[flag]]
     if not axes:raise ValueError('Hãy chọn ít nhất một axis.')
-    sensor=c['windowing_sensor_combo'];columns=[f'{sensor}_{a}_mg' for a in axes]
+    sensor = c['windowing_sensor_combo']
+    columns = [f'{sensor}_{a}_mg' for a in axes]
+
+    if sensor == 'Trunk' and options(config)['apa']:
+        columns.extend([
+            'Trunk_Posture_Forward_mg',
+            'Trunk_Posture_Vertical_mg',
+            'Trunk_Posture_Lateral_mg',
+        ])
     items=[];meta=[];sid=0
     for _,frame in runs:
         # Never join separate runs; outside-experiment samples cannot reach ML.
@@ -504,7 +555,7 @@ def _canonicalize_dict(config):
         if c['window_label_mode_combo'] not in ['Majority','FOG Threshold','Strict FOG']:raise ValueError('Quy tắc nhãn không hợp lệ.')
         result['feature_schema']='one-window-per-row'
     result['schema']='fog-unified-v1'
-    result['feature_version'] = 'original14-welch64-bandfix-v2'
+    result['feature_version'] = 'selected-individual-features-v4-apa-fusion'
     fo=options(result)
     has_individual_selection = (
         fo['axis_features'] != BASE
@@ -514,7 +565,7 @@ def _canonicalize_dict(config):
     # so GUI, batch, NPZ/CSV and trainer all receive the exact same feature schema.
     if has_individual_selection or fo['cfs']:
         result['feature_options'] = serialize_options(fo)
-        result['feature_version'] = 'selected-individual-features-v3'
+        result['feature_version'] = 'selected-individual-features-v4-apa-fusion'
         result['feature_names'] = feature_names(result)
         result['undefined_feature_policy'] = 'nan; train-fold median imputation with indicators; empty features -> 0'
     else:

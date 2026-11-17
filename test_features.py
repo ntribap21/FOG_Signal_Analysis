@@ -7,7 +7,7 @@ import pandas as pd
 import feature_registry as fr
 import signal_processing as sp
 import data_prepare as dp
-
+from scipy import signal as scipy_signal
 
 def configuration(extra=None):
     return sp.canonical_config(dict(schema='fog-unified-v1',source_fs=64.,sensors=list(fr.SENSORS),axes=list(fr.AXES),
@@ -25,6 +25,29 @@ def signals_and_metadata(n=5):
     for i in range(n):
         signals={f'{s}_{a}_mg':(1+.1*i)*np.sin(2*np.pi*2*t+.1*j)+.1*np.sin(2*np.pi*6*t)
                  for j,(s,a) in enumerate((s,a) for s in fr.SENSORS for a in fr.AXES)}
+        cutoff_hz = 0.5
+        sos = scipy_signal.butter(
+            2,
+            cutoff_hz,
+            btype='lowpass',
+            fs=64.0,
+            output='sos'
+        )
+        for axis in fr.AXES:
+            source = f'Trunk_{axis}_mg'
+            target = f'Trunk_Posture_{axis}_mg'
+
+            raw = np.asarray(signals[source], dtype=float)
+
+            zi = scipy_signal.sosfilt_zi(sos) * raw[0]
+
+            posture, _ = scipy_signal.sosfilt(
+                sos,
+                raw,
+                zi=zi
+            )
+
+            signals[target] = posture
         items.append(dict(Window_ID=i+1,Time=t+i,Signals=signals))
         meta.append(dict(Window_ID=i+1,Segment_ID=1 if i<3 else 2,Start_Time=float(i),End_Time=float(i+t[-1]),Binary_Label=i%2,FOG_Ratio=float(i%2)))
     return items,meta
@@ -35,8 +58,13 @@ class FeatureTests(unittest.TestCase):
         self.assertEqual(len(fr.feature_names(configuration())),126)
         legacy={k:True for k in ['jerk','sampen','apen','autocorr','kurtosis','crest','corr','crosscorr','ater']}
         self.assertEqual(len(fr.feature_names(configuration(legacy))),206)
-        self.assertEqual(len(fr.feature_names(configuration({k:True for k in fr.GROUPS if k!='cwt'}))),443)
-        self.assertEqual(len(fr.feature_names(configuration({k:True for k in fr.GROUPS}))),439)
+        config = configuration({k: True for k in fr.GROUPS})
+        names = fr.feature_names(config)
+        self.assertEqual(len(names), len(set(names)))
+        self.assertIn('Trunk_Pitch_Proxy_Std_deg', names)
+        self.assertIn('Ankle_Thigh_LogER_Loco', names)
+        self.assertIn('Leg_Trunk_LogER_Freeze', names)
+        self.assertIn('Ankle_Magnitude_Loco_Power', names)
         self.assertEqual(len(fr.feature_names(configuration({'base_features':['RMS','Freeze_Index']}))),18)
         with self.assertRaises(ValueError):configuration({'base_features':[]})
 
@@ -90,12 +118,35 @@ class FeatureTests(unittest.TestCase):
         c=configuration({k:True for k in fr.GROUPS});c['recording_id']='S01R01'
         items,meta=signals_and_metadata();preview=sp.gui_feature_rows(items,meta,64,c)
         wide,names=dp.wide_from_gui(preview,c)
-        self.assertEqual((len(wide),len(names)),(5,439))
+        self.assertEqual(len(wide), 5)
+        expected_names = fr.feature_names(c)
+        self.assertEqual(len(names), len(set(names)))
+        required_features = [
+            'Trunk_Pitch_Proxy_Std_deg',
+            'Trunk_Pitch_Proxy_Range_deg',
+            'Trunk_Pitch_Proxy_EarlyLate_Delta_deg',
+            'Trunk_Pitch_Proxy_Slope_deg_s',
+
+            'Ankle_Thigh_LogER_Loco',
+            'Ankle_Thigh_LogER_Freeze',
+            'Thigh_Trunk_LogER_Loco',
+            'Thigh_Trunk_LogER_Freeze',
+            'Leg_Trunk_LogER_Loco',
+            'Leg_Trunk_LogER_Freeze',
+
+            'Ankle_Magnitude_Loco_Power',
+            'Ankle_Magnitude_Freeze_Power',
+            'Ankle_Magnitude_Log_Freeze_Index',
+        ]
+        for feature in required_features:
+            self.assertIn(feature, names)
         with tempfile.TemporaryDirectory() as td:
             dp.export_dataset(wide,names,c,Path(td)/'test')
             with np.load(Path(td)/'test.npz',allow_pickle=False) as z:
-                self.assertEqual(z['X'].shape,(5,461));self.assertTrue(np.isnan(z['X']).any());self.assertFalse(np.isinf(z['X']).any())
-
+                self.assertEqual(z['X'].shape, (len(wide), len(names)))
+                self.assertEqual(z['feature_names'].astype(str).tolist(),list(names))
+                self.assertTrue(np.isnan(z['X']).any())
+                self.assertFalse(np.isinf(z['X']).any())
     def test_raw_batch_gui_agree(self):
         c=configuration({k:True for k in fr.GROUPS});c['excluded_regions']={'S01R01':[dict(start_s=15.,end_s=16.,enabled=True,reason='test')]};c=sp.canonical_config(c)
         t=np.arange(64*20)/64

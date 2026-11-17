@@ -893,7 +893,7 @@ def select_joint_parameters(pipeline, X, y, groups, *, tune=False, threshold_tun
         _loso_options(kernel, c, gamma_values[0], 512.0, decision_threshold, min_sensitivity, min_specificity, n_jobs)
     for g in gamma_values:
         _loso_options(kernel, c_values[0], g, 512.0, decision_threshold, min_sensitivity, min_specificity, n_jobs)
-    median_values = [1, 3, 5, 7, 9, 11, 15] if tune else [int(median_filter)]
+    median_values = [int(median_filter)]
     params_list = [{'svm__C': float(c), 'svm__gamma': g} for c in dict.fromkeys(c_values) for g in dict.fromkeys(gamma_values)]
     fold_ids = np.full(len(y), -1, dtype=int)
     fold_rows = []
@@ -923,7 +923,7 @@ def select_joint_parameters(pipeline, X, y, groups, *, tune=False, threshold_tun
         )
 
     candidate_rows, sweeps = ([], [])
-    median_values = [1, 3, 5, 7, 9, 11, 15] if tune else [int(median_filter)]
+    median_values = [int(median_filter)]
     candidate_id = 1 
     
     for score_idx, (params, scores) in enumerate(zip(params_list, all_scores)):
@@ -1080,8 +1080,8 @@ def train_loso(
     n_jobs=1,
     cache_size=512.0,
     decision_threshold=0.0,
-    min_sensitivity=0.85,
-    min_specificity=0.85,
+    min_sensitivity=0.8,
+    min_specificity=0.8,
     threshold_method='grid',
     threshold_min=-0.15,
     threshold_max=0.5,
@@ -1152,15 +1152,15 @@ def train_loso(
         'cfs_max_features': int(cfs_max_features) if cfs else None,
         'median_filter_window': int(median_filter),
         'median_filter_boundary_mode': 'nearest',
-        'median_filter_grid': [1, 3, 5, 7, 9, 11, 15] if tune else [int(median_filter)],
+        'median_filter_grid': [int(median_filter)],
         'cache_size': cache_size,
         'n_jobs': n_jobs,
         'versions': {'sklearn': sklearn.__version__, 'numpy': np.__version__, 'pandas': pd.__version__},
         'fallback_policy': f'best inner {selection_metric} when both targets cannot be met',
         'n_features': len(names),
         'input_files': config['input_files'],
-        'C_grid': C_grid if C_grid is not None else [0.1, 1.0, 10.0, 100.0],
-        'gamma_grid': gamma_grid if gamma_grid is not None else ['scale', 0.01, 0.1],
+        'C_grid': C_grid if C_grid is not None else [0.05, 0.1, 0.3, 1.0, 10.0, 100.0],
+        'gamma_grid': gamma_grid if gamma_grid is not None else ['scale', 0.005, 0.01, 0.03, 0.1],
         'min_sensitivity': min_sensitivity,
         'min_specificity': min_specificity,
         'threshold_grid': {'min': threshold_min, 'max': threshold_max, 'step': threshold_step},

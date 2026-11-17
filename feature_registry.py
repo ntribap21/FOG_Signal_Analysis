@@ -60,7 +60,7 @@ AXIS_FEATURE_SECTIONS = {
 
 WINDOW_FEATURE_SECTIONS = {
     'MAGNITUDE FEATURES (per sensor)': [
-        'Mean', 'RMS', 'Freeze_Index', 'Jerk_RMS'
+        'Mean', 'RMS', 'Freeze_Index', 'Jerk_RMS', 'Loco_Power', 'Freeze_Power', 'Log_Freeze_Index',
     ],
     'TEMPORAL FEATURES (per sensor / axis)': [
         'Delta_RMS', 'Delta_Freeze_Index', 'RMS_Trend_g_s'
@@ -79,6 +79,20 @@ WINDOW_FEATURE_SECTIONS = {
         'CWT_FOG_Index_Signed', 'CWT_FOG_Index_Abs'
     ],
     'RODRIGUEZ / AHLRICHS MULTI-AXIS FEATURES': RODRIGUEZ_WINDOW_FEATURES,
+    'APA / TRUNK POSTURAL CONTEXT': [
+        'Trunk_Pitch_Proxy_Std_deg',
+        'Trunk_Pitch_Proxy_Range_deg',
+        'Trunk_Pitch_Proxy_EarlyLate_Delta_deg',
+        'Trunk_Pitch_Proxy_Slope_deg_s',
+    ],
+    'TRI-SENSOR ENERGY FUSION': [
+        'Ankle_Thigh_LogER_Loco',
+        'Ankle_Thigh_LogER_Freeze',
+        'Thigh_Trunk_LogER_Loco',
+        'Thigh_Trunk_LogER_Freeze',
+        'Leg_Trunk_LogER_Loco',
+        'Leg_Trunk_LogER_Freeze',
+    ],
 }
 
 # Legacy group catalog. Kept for migration of older saved configurations.
@@ -101,6 +115,8 @@ GROUPS = {
     'cwt': 'CWT db4 FOG index — Forward/Anterior only (signed + absolute)',
     'rodriguez_axis': 'Rodriguez/Mazilu per-axis features',
     'rodriguez_window': 'Rodriguez/Ahlrichs multi-axis features',
+    'apa': 'Trunk posture / APA-related context',
+    'sensor_fusion': 'Three-sensor energy fusion',
 }
 
 AXES = ('Forward', 'Vertical', 'Lateral')
@@ -124,7 +140,7 @@ DEFAULTS = dict(
     autocorr_max_s=1.0, crosscorr_max_s=0.25, ater_epsilon_g2=1e-8,
     wavelet_name='db4', wavelet_level=4, wavelet_mode='symmetric',
     magnitude_mode='dynamic', harmonic_f0_hz=1.0, harmonic_count=8,
-    temporal_history=3, cfs=False, cfs_max_features=30
+    temporal_history=3, cfs=False, cfs_max_features=30, apa_gravity_cutoff_hz=0.5,
 )
 
 _AXIS_OPTIONAL_ORDER = [
@@ -145,15 +161,54 @@ _WINDOW_GROUP_KEYS = {
     'ater': 'ANKLE–TRUNK ENERGY RATIO (ATER)',
     'cwt': 'CWT FEATURES (Forward / Anterior axis)',
     'rodriguez_window': 'RODRIGUEZ / AHLRICHS MULTI-AXIS FEATURES',
+    'apa': 'APA / TRUNK POSTURAL CONTEXT',
+    'sensor_fusion': 'TRI-SENSOR ENERGY FUSION',
 }
 _WINDOW_DEFAULTS = {
-    'magnitude': ['Mean', 'RMS', 'Freeze_Index', 'Jerk_RMS'],
-    'temporal': ['Delta_RMS', 'Delta_Freeze_Index', 'RMS_Trend_g_s'],
-    'corr': ['Corr_Forward_Vertical', 'Corr_Forward_Lateral', 'Corr_Vertical_Lateral'],
+    'magnitude': [
+        'Mean', 'RMS', 'Freeze_Index', 'Jerk_RMS',
+        'Loco_Power', 'Freeze_Power', 'Log_Freeze_Index'
+    ],
+
+    'temporal': [
+        'Delta_RMS', 'Delta_Freeze_Index', 'RMS_Trend_g_s'
+    ],
+
+    'corr': [
+        'Corr_Forward_Vertical',
+        'Corr_Forward_Lateral',
+        'Corr_Vertical_Lateral'
+    ],
+
     'crosscorr': ['Mag_XCorr', 'Mag_XCorr_Lag_s'],
-    'ater': ['Ankle_Trunk_LogATER_Loco', 'Ankle_Trunk_LogATER_Freeze'],
-    'cwt': ['CWT_FOG_Index_Signed', 'CWT_FOG_Index_Abs'],
+
+    'ater': [
+        'Ankle_Trunk_LogATER_Loco',
+        'Ankle_Trunk_LogATER_Freeze'
+    ],
+
+    'cwt': [
+        'CWT_FOG_Index_Signed',
+        'CWT_FOG_Index_Abs'
+    ],
+
     'rodriguez_window': list(RODRIGUEZ_WINDOW_FEATURES),
+
+    'apa': [
+        'Trunk_Pitch_Proxy_Std_deg',
+        'Trunk_Pitch_Proxy_Range_deg',
+        'Trunk_Pitch_Proxy_EarlyLate_Delta_deg',
+        'Trunk_Pitch_Proxy_Slope_deg_s',
+    ],
+
+    'sensor_fusion': [
+        'Ankle_Thigh_LogER_Loco',
+        'Ankle_Thigh_LogER_Freeze',
+        'Thigh_Trunk_LogER_Loco',
+        'Thigh_Trunk_LogER_Freeze',
+        'Leg_Trunk_LogER_Loco',
+        'Leg_Trunk_LogER_Freeze',
+    ],
 }
 _WINDOW_ORDER = list(WINDOW_FEATURE_SECTIONS)
 WINDOW_FEATURE_SECTION_GROUPS = {
@@ -218,8 +273,8 @@ def options(config):
         raise ValueError('Entropy tolerance phải trong (0,1]')
     if not 0 < out['autocorr_min_s'] < out['autocorr_max_s']:
         raise ValueError('Autocorr lag không hợp lệ')
-    if not 0 < out['crosscorr_max_s'] <= 1 or out['ater_epsilon_g2'] <= 0:
-        raise ValueError('Cross-correlation / ATER parameter không hợp lệ')
+    if not 0.1 <= out['apa_gravity_cutoff_hz'] <= 2.0:
+        raise ValueError('APA gravity cutoff phải trong khoảng 0.1–2.0 Hz.')
     if out['wavelet_name'] not in ('db4', 'db8') or out['wavelet_mode'] not in ('symmetric', 'periodization'):
         raise ValueError('Wavelet / extension mode không hợp lệ.')
     for key, lo, hi in [
@@ -272,6 +327,8 @@ def options(config):
     out['ater'] = bool(out['window_features']['ater'])
     out['cwt'] = bool(out['window_features']['cwt'])
     out['rodriguez_window'] = bool(out['window_features']['rodriguez_window'])
+    out['apa'] = bool(out['window_features']['apa'])
+    out['sensor_fusion'] = bool(out['window_features']['sensor_fusion'])
 
     return out
 
@@ -342,6 +399,22 @@ def window_names(config):
         if not {'Ankle', 'Trunk'}.issubset(config['sensors']) or set(config['axes']) != set(AXES):
             raise ValueError('ATER cần Ankle + Trunk và đủ 3 trục; dùng Batch Configuration.')
         out.extend(selected['ater'])
+    if selected['apa']:
+        if 'Trunk' not in config['sensors'] or set(config['axes']) != set(AXES):
+            raise ValueError(
+                'APA cần cảm biến Trunk và đủ Forward, Vertical, Lateral.'
+            )
+        out.extend(selected['apa'])
+
+    if selected['sensor_fusion']:
+        if (
+            not {'Ankle', 'Thigh', 'Trunk'}.issubset(config['sensors'])
+            or set(config['axes']) != set(AXES)
+        ):
+            raise ValueError(
+                'Sensor Fusion cần Ankle + Thigh + Trunk và đủ 3 trục.'
+            )
+        out.extend(selected['sensor_fusion'])
 
     if selected['cwt']:
         if 'Forward' not in config['axes']:
@@ -624,11 +697,33 @@ def window_extra(signals, fs, config, channel_values):
                 values['Mean'] = float(vm.mean())
             if 'RMS' in magnitude_selected:
                 values['RMS'] = float(np.sqrt(np.mean(vm * vm)))
-            if 'Freeze_Index' in magnitude_selected:
+            power_features = {
+                'Freeze_Index',
+                'Loco_Power',
+                'Freeze_Power',
+                'Log_Freeze_Index'
+            }
+
+            if set(magnitude_selected).intersection(power_features):
                 f, p = window_psd(vm, fs)
-                loco = band_power(f, p, .5, 3.)
-                freeze = band_power(f, p, 3., 8.)
-                values['Freeze_Index'] = freeze / loco if loco > 0 else 0.
+
+                loco = band_power(f, p, 0.5, 3.0)
+                freeze = band_power(f, p, 3.0, 8.0)
+                eps = o['ater_epsilon_g2']
+
+                if 'Freeze_Index' in magnitude_selected:
+                    values['Freeze_Index'] = freeze / loco if loco > 0 else 0.0
+
+                if 'Loco_Power' in magnitude_selected:
+                    values['Loco_Power'] = loco
+
+                if 'Freeze_Power' in magnitude_selected:
+                    values['Freeze_Power'] = freeze
+
+                if 'Log_Freeze_Index' in magnitude_selected:
+                    values['Log_Freeze_Index'] = float(
+                        np.log((freeze + eps) / (loco + eps))
+                    )
             if 'Jerk_RMS' in magnitude_selected:
                 values['Jerk_RMS'] = float(np.sqrt(np.mean((np.diff(vm) * fs) ** 2)))
             out.update({f'{sensor}_Magnitude_{key}': value for key, value in values.items()})
@@ -689,6 +784,7 @@ def window_extra(signals, fs, config, channel_values):
                 out[f'{sensor}_Forward_{key}'] = cwt_vals[key]
 
     rod_selected = set(selected['rodriguez_window'])
+    
     if rod_selected:
         if set(config['axes']) != set(AXES):
             raise ValueError('Rodriguez/Ahlrichs multi-axis cần đủ 3 trục.')
@@ -738,6 +834,89 @@ def window_extra(signals, fs, config, channel_values):
                 values.update({f'PCA_{i + 1}': pca[i] for i in range(3) if f'PCA_{i + 1}' in pca_selected})
 
             out.update({f'{sensor}_{key}': value for key, value in values.items()})
+            # APA-related trunk posture proxies
+    apa_selected = selected['apa']
+
+    if apa_selected:
+        ap = np.asarray(
+            signals['Trunk_Posture_Forward_mg'], dtype=float
+        )
+        vertical = np.asarray(
+            signals['Trunk_Posture_Vertical_mg'], dtype=float
+        )
+        lateral = np.asarray(
+            signals['Trunk_Posture_Lateral_mg'], dtype=float
+        )
+
+        denominator = np.sqrt(vertical**2 + lateral**2)
+
+        theta = np.degrees(
+            np.arctan2(ap, denominator)
+        )
+
+        n = len(theta)
+        midpoint = n // 2
+
+        if 'Trunk_Pitch_Proxy_Std_deg' in apa_selected:
+            out['Trunk_Pitch_Proxy_Std_deg'] = float(
+                np.std(theta)
+            )
+
+        if 'Trunk_Pitch_Proxy_Range_deg' in apa_selected:
+            out['Trunk_Pitch_Proxy_Range_deg'] = float(
+                np.max(theta) - np.min(theta)
+            )
+
+        if 'Trunk_Pitch_Proxy_EarlyLate_Delta_deg' in apa_selected:
+            out['Trunk_Pitch_Proxy_EarlyLate_Delta_deg'] = float(
+                np.mean(theta[midpoint:]) - np.mean(theta[:midpoint])
+            )
+
+        if 'Trunk_Pitch_Proxy_Slope_deg_s' in apa_selected:
+            t = np.arange(n, dtype=float) / fs
+            tc = t - np.mean(t)
+            slope = np.sum(tc * (theta - np.mean(theta))) / np.sum(tc**2)
+
+            out['Trunk_Pitch_Proxy_Slope_deg_s'] = float(slope)
+        # Tri-sensor energy fusion
+    fusion_selected = selected['sensor_fusion']
+
+    if fusion_selected:
+        eps = o['ater_epsilon_g2']
+
+        def sensor_energy(sensor, band):
+            key = f'{band}_Power'
+            return sum(
+                channel_values[(sensor, axis)][key]
+                for axis in AXES
+            )
+
+        for feature in fusion_selected:
+            pair_name, band = feature.rsplit('_LogER_', 1)
+
+            if pair_name == 'Ankle_Thigh':
+                numerator = sensor_energy('Ankle', band)
+                denominator = sensor_energy('Thigh', band)
+
+            elif pair_name == 'Thigh_Trunk':
+                numerator = sensor_energy('Thigh', band)
+                denominator = sensor_energy('Trunk', band)
+
+            elif pair_name == 'Leg_Trunk':
+                numerator = (
+                    sensor_energy('Ankle', band)
+                    + sensor_energy('Thigh', band)
+                )
+                denominator = sensor_energy('Trunk', band)
+
+            else:
+                raise ValueError(
+                    f'Sensor Fusion feature không hợp lệ: {feature}'
+                )
+
+            out[feature] = float(
+                np.log((numerator + eps) / (denominator + eps))
+            )
 
     return out
 
