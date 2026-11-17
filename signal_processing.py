@@ -30,25 +30,36 @@ FOG_STAR_SIGNAL_COLS = [
 ]
 def read_fog_star_csv(csv_path, subject_filter=None, max_interp_gap_sec=0.25, fs=60.0):
     df = pd.read_csv(csv_path)
-    col_map = {c.strip(): c.strip() for c in df.columns}
+    df.columns = [c.strip() for c in df.columns]
     if 'subject_id' in df.columns and 'subjectID' not in df.columns:
         df.rename(columns={'subject_id': 'subjectID'}, inplace=True)
     if 'task_id' in df.columns and 'taskID' not in df.columns:
         df.rename(columns={'task_id': 'taskID'}, inplace=True)
+
     missing_cols = [c for c in FOG_STAR_SIGNAL_COLS if c not in df.columns]
     if missing_cols:
         raise ValueError(f"Tệp FoG-STAR thiếu các kênh tín hiệu: {missing_cols[:5]}...")
+    if 'fog' not in df.columns:
+        raise ValueError("Tệp FoG-STAR thiếu cột nhãn 'fog' (0/1).")
+
     if subject_filter is not None:
         df = df[df['subjectID'].isin(subject_filter)].copy()
+
     df['Subject_ID'] = df['subjectID'].apply(lambda x: f"S{int(x):02d}")
-    session_col = df['sessionID'] if 'sessionID' in df.columns else 1
     task_col = df['taskID'] if 'taskID' in df.columns else 1
     df['Recording_ID'] = [
         f"S{int(s):02d}T{int(t):02d}" for s, t in zip(df['subjectID'], task_col)
     ]
-    df['Binary_Label'] = df['fog'].astype(np.int8)
+
+    # Đọc trực tiếp nhãn 'fog' (0 hoặc 1), không dùng hàm ánh xạ của Daphnet
+    fog_vals = pd.to_numeric(df['fog'], errors='raise').fillna(0).astype(np.int8)
+    if not fog_vals.isin([0, 1]).all():
+        raise ValueError("Cột 'fog' của FoG-STAR chỉ được chứa 0 hoặc 1.")
+    df['Binary_Label'] = fog_vals
+    df['Label'] = fog_vals
     df['Original_Label'] = np.where(df['Binary_Label'] == 1, 2, 1)
     df['Valid_Experiment'] = True
+
     max_gap_samples = int(round(max_interp_gap_sec * fs))
     processed_segments = []
     segment_counter = 0
@@ -58,34 +69,33 @@ def read_fog_star_csv(csv_path, subject_filter=None, max_interp_gap_sec=0.25, fs
 
     for _, group in df.groupby(group_cols, sort=False):
         group = group.reset_index(drop=True)
-
-        #Timestamp/lost signal processing:
         time_col = next((c for c in ('time', 'timestamp', 'Time_s', 'Time_ms') if c in group.columns), None)
         if time_col is not None:
             t_raw = group[time_col].to_numpy(dtype=float)
-            if time_col == 'Time_ms' or np.nanmedian(np.diff(t_raw)) > 1.0:
-                t_sec = t_raw / 1000.0
-            else:
-                t_sec = t_raw
+            t_sec = t_raw / 1000.0 if (time_col == 'Time_ms' or np.nanmedian(np.diff(t_raw)) > 1.0) else t_raw
             dt = np.diff(t_sec)
             breaks = np.flatnonzero(dt > max_interp_gap_sec) + 1
         else:
             breaks = []
-        
+
         sub_chunks = np.split(group, breaks) if len(breaks) else [group]
         for chunk in sub_chunks:
             if len(chunk) < int(2.0 * fs):
                 continue
             chunk = chunk.copy().reset_index(drop=True)
-            chunk[FOG_STAR_SIGNAL_COLS] = chunk[FOG_STAR_SIGNAL_COLS].interpolate(
-                method='linear', limit=max_gap_samples, limit_direction='both'
+            # Khử Inf và nội suy + bfill + ffill để đảm bảo 0% NaN
+            chunk[FOG_STAR_SIGNAL_COLS] = (
+                chunk[FOG_STAR_SIGNAL_COLS]
+                .astype(float)
+                .replace([np.inf, -np.inf], np.nan)
+                .interpolate(method='linear', limit=max_gap_samples, limit_direction='both', axis=0)
+                .bfill(axis=0)
+                .ffill(axis=0)
             )
             valid_mask = chunk[FOG_STAR_SIGNAL_COLS].notna().all(axis=1).to_numpy()
             if not valid_mask.all():
                 edges = np.diff(np.r_[False, valid_mask, False].astype(int))
-                starts = np.flatnonzero(edges == 1)
-                ends = np.flatnonzero(edges == -1)
-                for st, en in zip(starts, ends):
+                for st, en in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)):
                     if en - st >= int(2.0 * fs):
                         sub = chunk.iloc[st:en].copy().reset_index(drop=True)
                         sub['Segment_ID'] = segment_counter
@@ -97,10 +107,61 @@ def read_fog_star_csv(csv_path, subject_filter=None, max_interp_gap_sec=0.25, fs
                 chunk['Time_ms'] = np.arange(len(chunk), dtype=float) * (1000.0 / fs)
                 processed_segments.append((segment_counter, chunk))
                 segment_counter += 1
+
     if not processed_segments:
         raise ValueError("Không trích xuất được đoạn tín hiệu hợp lệ nào từ tệp FoG-STAR.")
-
     return processed_segments
+
+
+def adaptive_sliding_windows(segments, fs, window_sec=2.0, overlap_pct=50.0, label_mode='Majority', fog_thresh_pct=50.0):
+    win_samples = int(round(window_sec * fs)) # 120 mẫu khi fs=60.0, 128 mẫu khi fs=64.0
+    step_samples = max(1, int(round(win_samples * (1.0 - overlap_pct / 100.0))))
+    windows_data = []
+    windows_meta = []
+    win_id = 0
+    for seg_id, seg_df in segments:
+        n_total = len(seg_df)
+        if n_total < win_samples:
+            continue
+        labels = seg_df['Binary_Label'].to_numpy(dtype=np.int8)
+        times_s = seg_df['Time_ms'].to_numpy(dtype=float) / 1000.0
+        subj_id = str(seg_df['Subject_ID'].iloc[0])
+        rec_id = str(seg_df['Recording_ID'].iloc[0])
+        for start_idx in range(0, n_total - win_samples + 1, step_samples):
+            end_idx = start_idx + win_samples
+            w_labels = labels[start_idx:end_idx]
+            fog_ratio = float(np.mean(w_labels == 1))
+
+            if label_mode == 'Majority':
+                y_win = 1 if fog_ratio >= 0.5 else 0
+            elif label_mode == 'Strict FOG':
+                y_win = 1 if fog_ratio == 1.0 else 0
+            else:
+                y_win = 1 if (fog_ratio * 100.0) >= fog_thresh_pct else 0
+
+            meta = {
+                'Subject_ID': subj_id,
+                'Recording_ID': rec_id,
+                'Segment_ID': int(seg_id),
+                'Window_ID': win_id,
+                'Start_Time': float(times_s[start_idx]),
+                'End_Time': float(times_s[end_idx - 1]),
+                'Samples': win_samples,
+                'FOG_Ratio': fog_ratio,
+                'Binary_Label': int(y_win),
+                'Label': int(y_win),
+            }
+            for extra_col in ('taskID', 'activity', 'fog_severity'):
+                if extra_col in seg_df.columns:
+                    vals = seg_df[extra_col].iloc[start_idx:end_idx]
+                    meta[extra_col] = int(vals.mode().iloc[0]) if not vals.empty else 0
+
+            # ĐÃ SỬA THỤT LỀ: Chỉ append 1 lần cho mỗi cửa sổ!
+            windows_meta.append(meta)
+            windows_data.append(seg_df.iloc[start_idx:end_idx])
+            win_id += 1
+
+    return windows_data, windows_meta, win_samples, step_samples
 
 def bandpass_and_detrend_segment(df_segment, signal_cols, fs, lowcut=0.5, highcut=16.0, order=4, detrend_type='linear'):
     out = df_segment.copy()
@@ -121,53 +182,6 @@ def bandpass_and_detrend_segment(df_segment, signal_cols, fs, lowcut=0.5, highcu
         out[col] = x_filt
 
     return out
-def adaptive_sliding_windows(segments, fs, window_sec=2.0, overlap_pct=50.0, label_mode='Majority', fog_thresh_pct=50.0):
-    win_samples = int(round(window_sec * fs))
-    step_samples = max(1, int(round(win_samples * (1.0 - overlap_pct / 100.0))))
-    windows_data = []
-    windows_meta = []
-    win_id = 0
-    for seg_id, seg_df in segments:
-        n_total = len(seg_df)
-        if n_total < win_samples:
-            continue
-
-        labels = seg_df['Binary_Label'].to_numpy(dtype=np.int8)
-        times_s = seg_df['Time_ms'].to_numpy(dtype=float) / 1000.0
-        subj_id = str(seg_df['Subject_ID'].iloc[0])
-        rec_id = str(seg_df['Recording_ID'].iloc[0])
-        for start_idx in range(0, n_total - win_samples + 1, step_samples):
-            end_idx = start_idx + win_samples
-            w_labels = labels[start_idx:end_idx]
-            fog_ratio = float(np.mean(w_labels == 1))
-
-            if label_mode == 'Majority':
-                y_win = 1 if fog_ratio >= 0.5 else 0
-            elif label_mode == 'Strict FOG':
-                y_win = 1 if fog_ratio == 1.0 else 0
-            else:
-                y_win = 1 if (fog_ratio * 100.0) >= fog_thresh_pct else 0
-            meta = {
-                'Subject_ID': subj_id,
-                'Recording_ID': rec_id,
-                'Segment_ID': int(seg_id),
-                'Window_ID': win_id,
-                'Start_Time': float(times_s[start_idx]),
-                'End_Time': float(times_s[end_idx - 1]),
-                'Samples': win_samples,
-                'FOG_Ratio': fog_ratio,
-                'Binary_Label': int(y_win),
-            }
-            for extra_col in ('taskID', 'activity', 'fog_severity'):
-                if extra_col in seg_df.columns:
-                    vals = seg_df[extra_col].iloc[start_idx:end_idx]
-                    meta[extra_col] = int(vals.mode().iloc[0]) if not vals.empty else 0
-
-                windows_meta.append(meta)
-                windows_data.append(seg_df.iloc[start_idx:end_idx])
-                win_id += 1
-
-    return windows_data, windows_meta, win_samples, step_samples
 
 def extract_features_for_profile(windows_data, windows_meta, fs, profile_name, engine):
     """
@@ -678,9 +692,12 @@ def gui_feature_rows(items,meta,fs,config):
 
 # Configuration/exclusion additions; algorithms above retain their original formulas.
 def recording_id(path):
-    name=Path(path).stem.upper()
-    match=re.fullmatch(r'(S\d+R\d+)(?:\(\d+\))?',name)
-    if not match: raise ValueError('Tên file phải là SxxRxx.txt (chấp nhận hậu tố bản sao (1)).')
+    name = Path(path).stem.upper()
+    if 'SENSOR' in name or 'FOG_STAR' in name or 'FOGSTAR' in name:
+        return name
+    match = re.fullmatch(r'(S\d+R\d+)(?:\(\d+\))?', name)
+    if not match:
+        raise ValueError('Tên file phải là SxxRxx.txt (Daphnet) hoặc sensor_data.csv (FoG-STAR).')
     return match.group(1)
 
 
@@ -717,7 +734,11 @@ def _canonicalize_dict(config):
         c=result['controls']
         for key in ['resample_checkbox','filter_checkbox','detrend_checkbox','windowing_axis_x_checkbox','windowing_axis_y_checkbox','windowing_axis_z_checkbox']:
             if not isinstance(c[key],bool):raise ValueError(key+' cần true/false.')
-        if result.get('source_fs',64)!=64:raise ValueError('DAPHNET source_fs phải là 64 Hz.')
+        source_fs = float(result.get('source_fs', 64.0))
+        if source_fs not in (60.0, 64.0):
+            raise ValueError('source_fs phải là 64 Hz (DAPHNET) hoặc 60 Hz (FoG-STAR).')
+        fs = float(c['target_fs_spinbox']) if c['resample_checkbox'] else source_fs
+        
         if c['detrend_type_combo'] not in ['Linear','Constant']:raise ValueError('Detrend type không hợp lệ.')
         if not 0<c['window_fog_threshold_spinbox']<=100:raise ValueError('FOG threshold phải >0 và <=100%.')
         if not np.isfinite(c['window_length_spinbox']):raise ValueError('Window length không hợp lệ.')
@@ -843,7 +864,48 @@ def gui_select(frame,config):
     return [(i+1,d) for i,(_,d) in enumerate(pieces)]
 
 
-def prepare_recording(path,config):
+def prepare_recording(path, config):
+    path = Path(path)
+    # Tự động nhận diện file FoG-STAR CSV
+    if path.suffix.lower() == '.csv':
+        header_cols = set(pd.read_csv(path, nrows=1).columns.str.strip())
+        if 'fog' in header_cols or 'ankleL_acc_x' in header_cols:
+            fs = 60.0
+            segments = read_fog_star_csv(path, fs=fs)
+            c = config['controls']
+            filtered_segments = [
+                (sid, bandpass_and_detrend_segment(
+                    seg_df, FOG_STAR_SIGNAL_COLS, fs=fs,
+                    lowcut=float(c.get('cutoff_1_spinbox', 0.5)),
+                    highcut=float(c.get('cutoff_2_spinbox', 20.0)),
+                    order=int(c.get('filter_order_spinbox', 4)),
+                    detrend_type=c.get('detrend_type_combo', 'linear') if c.get('detrend_checkbox', True) else None
+                ))
+                for sid, seg_df in segments
+            ]
+            win_data, win_meta, _, _ = adaptive_sliding_windows(
+                filtered_segments, fs=fs,
+                window_sec=float(c.get('window_length_spinbox', 2.0)),
+                overlap_pct=float(c.get('window_overlap_spinbox', 50.0)),
+                label_mode=c.get('window_label_mode_combo', 'Majority'),
+                fog_thresh_pct=float(c.get('window_fog_threshold_spinbox', 50.0)),
+            )
+            engine = ProcessingEngine(config)
+            table = extract_features_for_profile(win_data, win_meta, fs, 'FOG_STAR', engine)
+            table['Config_ID'] = config['config_id']
+            feat_cols = [col for col in table.columns if col not in (
+                'Subject_ID', 'Recording_ID', 'Segment_ID', 'Window_ID',
+                'Start_Time', 'End_Time', 'Samples', 'FOG_Ratio',
+                'Binary_Label', 'Label', 'taskID', 'activity', 'fog_severity', 'Config_ID'
+            )]
+            report = dict(
+                Recording_ID='FOG_STAR_ALL', Subject_ID='S01-S22', Status='ok',
+                Raw_Samples=sum(len(s) for _, s in segments),
+                Windows=len(table),
+                FOG_Windows=int((table['Label'] == 1).sum()),
+                Non_FOG_Windows=int((table['Label'] == 0).sum()),
+            )
+            return table, feat_cols, report
     config=canonical_config(config);rid=recording_id(path);local=copy.deepcopy(config);local['recording_id']=rid
     raw=gui_labels(gui_read_raw(path));regions=config['excluded_regions'].get(rid,[]);excluded=exclusion_mask(raw,regions)
     runs=gui_select(raw,local);processed,fs=gui_process(runs,local)
