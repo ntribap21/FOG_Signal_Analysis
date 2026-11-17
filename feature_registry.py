@@ -120,8 +120,14 @@ GROUPS = {
 }
 
 AXES = ('Forward', 'Vertical', 'Lateral')
-SENSORS = ('Ankle', 'Thigh', 'Trunk')
-
+DAPHNET_SENSORS = ('Ankle', 'Thigh', 'Trunk')
+FOG_STAR_SENSORS = (
+    'AnkleL_Acc', 'AnkleL_Gyro',
+    'AnkleR_Acc', 'AnkleR_Gyro',
+    'Back_Acc',   'Back_Gyro',
+    'Wrist_Acc',  'Wrist_Gyro',
+)
+SENSORS = DAPHNET_SENSORS + FOG_STAR_SENSORS
 PER_AXIS = {
     'jerk': ['Jerk_RMS'],
     'sampen': ['Sample_Entropy'],
@@ -349,16 +355,42 @@ def serialize_options(config_or_options):
 def axis_names(config):
     return list(options(config)['axis_features'])
 
+def _resolve_anatomical_sensors(sensors_list):
+    s_set = set(sensors_list)
+    ankle = 'Ankle' if 'Ankle' in s_set else ('AnkleL_Acc' if 'AnkleL_Acc' in s_set else ('AnkleR_Acc' if 'AnkleR_Acc' in s_set else None))
+    thigh = 'Thigh' if 'Thigh' in s_set else ('AnkleR_Acc' if 'AnkleR_Acc' in s_set else ('Wrist_Acc' if 'Wrist_Acc' in s_set else None))
+    trunk = 'Trunk' if 'Trunk' in s_set else ('Back_Acc' if 'Back_Acc' in s_set else None)
+    return ankle, thigh, trunk
 
 def pairs(config):
     ss = config['sensors']
     return [(a, b) for i, a in enumerate(ss) for b in ss[i + 1:]]
 
 
+def _resolve_anatomical_sensors(sensors_list):
+    """Tự động ánh xạ cảm biến Cổ chân / Đùi / Thân cho cả Daphnet và FoG-STAR."""
+    s_set = set(sensors_list)
+    ankle = 'Ankle' if 'Ankle' in s_set else (
+        'AnkleL_Acc' if 'AnkleL_Acc' in s_set else (
+            'AnkleR_Acc' if 'AnkleR_Acc' in s_set else None
+        )
+    )
+    thigh = 'Thigh' if 'Thigh' in s_set else (
+        'AnkleR_Acc' if 'AnkleR_Acc' in s_set else (
+            'Wrist_Acc' if 'Wrist_Acc' in s_set else None
+        )
+    )
+    trunk = 'Trunk' if 'Trunk' in s_set else (
+        'Back_Acc' if 'Back_Acc' in s_set else None
+    )
+    return ankle, thigh, trunk
+
+
 def window_names(config):
     o = options(config)
     selected = o['window_features']
     out = []
+    ankle_s, thigh_s, trunk_s = _resolve_anatomical_sensors(config['sensors'])
 
     if selected['magnitude']:
         if set(config['axes']) != set(AXES):
@@ -396,24 +428,18 @@ def window_names(config):
         )
 
     if selected['ater']:
-        if not {'Ankle', 'Trunk'}.issubset(config['sensors']) or set(config['axes']) != set(AXES):
-            raise ValueError('ATER cần Ankle + Trunk và đủ 3 trục; dùng Batch Configuration.')
+        if not (ankle_s and trunk_s) or set(config['axes']) != set(AXES):
+            raise ValueError('ATER cần Ankle/AnkleL_Acc + Trunk/Back_Acc và đủ 3 trục; dùng Batch Configuration.')
         out.extend(selected['ater'])
+
     if selected['apa']:
-        if 'Trunk' not in config['sensors'] or set(config['axes']) != set(AXES):
-            raise ValueError(
-                'APA cần cảm biến Trunk và đủ Forward, Vertical, Lateral.'
-            )
+        if not trunk_s or set(config['axes']) != set(AXES):
+            raise ValueError('APA cần cảm biến Trunk (hoặc Back_Acc) và đủ Forward, Vertical, Lateral.')
         out.extend(selected['apa'])
 
     if selected['sensor_fusion']:
-        if (
-            not {'Ankle', 'Thigh', 'Trunk'}.issubset(config['sensors'])
-            or set(config['axes']) != set(AXES)
-        ):
-            raise ValueError(
-                'Sensor Fusion cần Ankle + Thigh + Trunk và đủ 3 trục.'
-            )
+        if not (ankle_s and thigh_s and trunk_s) or set(config['axes']) != set(AXES):
+            raise ValueError('Sensor Fusion cần đủ 3 vị trí cảm biến và đủ 3 trục.')
         out.extend(selected['sensor_fusion'])
 
     if selected['cwt']:
@@ -435,7 +461,6 @@ def window_names(config):
         )
 
     return out
-
 
 def feature_names(config):
     return [
@@ -761,6 +786,8 @@ def window_extra(signals, fs, config, channel_values):
             if 'Mag_XCorr_Lag_s' in cross_selected:
                 out[f'{sensor_a}_{sensor_b}_Mag_XCorr_Lag_s'] = lag
 
+    ankle_s, thigh_s, trunk_s = _resolve_anatomical_sensors(config['sensors'])
+
     ater_selected = selected['ater']
     if ater_selected:
         for feature, band, key in [
@@ -768,8 +795,8 @@ def window_extra(signals, fs, config, channel_values):
             ('Ankle_Trunk_LogATER_Freeze', 'Freeze', 'Freeze_Power'),
         ]:
             if feature in ater_selected:
-                ea = sum(channel_values[('Ankle', a)][key] for a in AXES)
-                et = sum(channel_values[('Trunk', a)][key] for a in AXES)
+                ea = sum(channel_values[(ankle_s, a)][key] for a in AXES)
+                et = sum(channel_values[(trunk_s, a)][key] for a in AXES)
                 ep = o['ater_epsilon_g2']
                 out[feature] = float(np.log((ea + ep) / (et + ep)))
 
@@ -878,47 +905,30 @@ def window_extra(signals, fs, config, channel_values):
             slope = np.sum(tc * (theta - np.mean(theta))) / np.sum(tc**2)
 
             out['Trunk_Pitch_Proxy_Slope_deg_s'] = float(slope)
-        # Tri-sensor energy fusion
+    # Tri-sensor energy fusion
     fusion_selected = selected['sensor_fusion']
-
     if fusion_selected:
         eps = o['ater_epsilon_g2']
 
-        def sensor_energy(sensor, band):
+        def sensor_energy(sensor_name, band):
             key = f'{band}_Power'
-            return sum(
-                channel_values[(sensor, axis)][key]
-                for axis in AXES
-            )
+            return sum(channel_values[(sensor_name, axis)][key] for axis in AXES)
 
         for feature in fusion_selected:
             pair_name, band = feature.rsplit('_LogER_', 1)
-
             if pair_name == 'Ankle_Thigh':
-                numerator = sensor_energy('Ankle', band)
-                denominator = sensor_energy('Thigh', band)
-
+                numerator = sensor_energy(ankle_s, band)
+                denominator = sensor_energy(thigh_s, band)
             elif pair_name == 'Thigh_Trunk':
-                numerator = sensor_energy('Thigh', band)
-                denominator = sensor_energy('Trunk', band)
-
+                numerator = sensor_energy(thigh_s, band)
+                denominator = sensor_energy(trunk_s, band)
             elif pair_name == 'Leg_Trunk':
-                numerator = (
-                    sensor_energy('Ankle', band)
-                    + sensor_energy('Thigh', band)
-                )
-                denominator = sensor_energy('Trunk', band)
-
+                numerator = sensor_energy(ankle_s, band) + sensor_energy(thigh_s, band)
+                denominator = sensor_energy(trunk_s, band)
             else:
-                raise ValueError(
-                    f'Sensor Fusion feature không hợp lệ: {feature}'
-                )
+                raise ValueError(f'Sensor Fusion feature không hợp lệ: {feature}')
 
-            out[feature] = float(
-                np.log((numerator + eps) / (denominator + eps))
-            )
-
-    return out
+            out[feature] = float(np.log((numerator + eps) / (denominator + eps)))
 
 
 def wavelet_module():

@@ -74,11 +74,46 @@ from types import MethodType
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 from PySide6.QtWidgets import QListWidget, QProgressBar, QSizePolicy
 pg.setConfigOptions(antialias=False, background='w', foreground='#26364d', leftButtonPan=True)
-GUI_SENSORS = ('Ankle', 'Thigh', 'Trunk')
+DAPHNET_SENSORS = ('Ankle', 'Thigh', 'Trunk')
+FOG_STAR_SENSORS = (
+    'AnkleL_Acc', 'AnkleL_Gyro',
+    'AnkleR_Acc', 'AnkleR_Gyro',
+    'Back_Acc',   'Back_Gyro',
+    'Wrist_Acc',  'Wrist_Gyro',
+)
+GUI_SENSORS = DAPHNET_SENSORS + FOG_STAR_SENSORS
 GUI_AXES = ('Forward', 'Vertical', 'Lateral')
 GUI_FEATURES = ('Mean', 'RMS', 'Std', 'Variance', 'Min', 'Max', 'SMA', 'Dominant Frequency', 'Total Power', 'Loco Power', 'Freeze Power', 'Freeze Index', 'Low Freq Ratio', 'PSE')
 GUI_COLUMNS = ['Time_ms'] + [f'{s}_{a}_mg' for s in GUI_SENSORS for a in GUI_AXES] + ['Label']
-
+DATASET_PROFILES = {
+    'DAPHNET': {
+        'fs': 64.0,
+        'window_sec': 2.0,      # 128 mẫu
+        'overlap_pct': 50.0,    # Step 64 mẫu (1s)
+        'file_filter': 'DAPHNET Raw (*.txt *.csv)',
+        'sensors': ('Ankle', 'Thigh', 'Trunk'),
+        'axes': ('Forward', 'Vertical', 'Lateral'),
+        'channels': 9,
+        'subjects': 10,
+        'filter_type': 'Band-pass',
+        'cutoff_1': 0.5,
+        'cutoff_2': 20.0,
+    },
+    'FOG_STAR': {
+        'fs': 60.0,
+        'window_sec': 2.0,      # 120 mẫu
+        'overlap_pct': 50.0,    # Step 60 mẫu (1s)
+        'file_filter': 'FoG-STAR Sensor CSV (*.csv)',
+        'sensors': ('ankleL_acc', 'ankleL_gyro', 'ankleR_acc', 'ankleR_gyro', 
+                    'back_acc', 'back_gyro', 'wrist_acc', 'wrist_gyro'),
+        'axes': ('x', 'y', 'z'),
+        'channels': 24,
+        'subjects': 22,
+        'filter_type': 'Band-pass',
+        'cutoff_1': 0.5,
+        'cutoff_2': 20.0,
+    }
+}
 class GUIWorker(QObject):
     done = Signal(object)
     failed = Signal(str)
@@ -252,6 +287,15 @@ class SignalViewer(QWidget):
         lx = []
         ly = []
         sensor = self.sensor.currentText()
+        if not sensor:
+            self._drawing = False
+            return
+        is_gyro = 'Gyro' in sensor
+        self.chart.getPlotItem().setLabel(
+            'left',
+            'Angular Velocity' if is_gyro else 'Acceleration',
+            units='deg/s' if is_gyro else 'g'
+        )
         binary = self.labels.currentIndex() == 1
         for _, df in self.runs:
             if self.scope.currentIndex() == 1:
@@ -547,6 +591,19 @@ class FOGSignalAnalyzer(QMainWindow):
         title = QLabel('FOG SIGNAL ANALYZER')
         title.setStyleSheet('font-size:22px;font-weight:700')
         top.addWidget(title)
+        top.addSpacing(15)
+
+        self.active_profile = 'DAPHNET'
+        self.btn_profile_daphnet = QPushButton('DAPHNET (64Hz · 9ch)')
+        self.btn_profile_fogstar = QPushButton('FoG-STAR (60Hz · 24ch)')
+        for btn in (self.btn_profile_daphnet, self.btn_profile_fogstar):
+            btn.setCheckable(True)
+            btn.setFixedWidth(175)
+        self.btn_profile_daphnet.setChecked(True)
+        self.btn_profile_daphnet.clicked.connect(lambda: self.activate_dataset_profile('DAPHNET'))
+        self.btn_profile_fogstar.clicked.connect(lambda: self.activate_dataset_profile('FOG_STAR'))
+        top.addWidget(self.btn_profile_daphnet)
+        top.addWidget(self.btn_profile_fogstar)
         top.addStretch()
         self.open_button = self._button('OPEN DATASET', self.open_dataset)
         top.addWidget(self.open_button)
@@ -586,6 +643,36 @@ class FOGSignalAnalyzer(QMainWindow):
         self._go(self.dataset_page)
         self.setStyleSheet(self.styleSheet() + '\n            QListWidget{border:1px solid #c5cdd9;font-size:13px;background:#f8faff;}\n            QListWidget::item{padding:10px 7px;}\n            QListWidget::item:selected{background:#416fba;color:white;}\n            QPushButton{min-height:24px;max-height:24px;padding:4px 10px;}\n            QGroupBox{border:1px solid #c5cdd9;margin-top:10px;padding:10px;}\n            QComboBox,QDoubleSpinBox,QSpinBox{min-height:26px;max-height:26px;padding:2px 6px;}\n        ')
         self.statusBar().showMessage('Raw giữ nguyên · Các hàm xử lý và công thức feature gốc được giữ lại.')
+
+    def activate_dataset_profile(self, profile_name):
+        if profile_name not in DATASET_PROFILES:
+            return
+        self.active_profile = profile_name
+        prof = DATASET_PROFILES[profile_name]
+        self.btn_profile_daphnet.setChecked(profile_name == 'DAPHNET')
+        self.btn_profile_fogstar.setChecked(profile_name == 'FOG_STAR')
+        self.sampling_rate = prof['fs']
+        self.windowing_sampling_rate = prof['fs']
+        self.resample_checkbox.setChecked(False) # Giữ nguyên Fs gốc của Profile (64 hoặc 60 Hz)
+        self.target_fs_spinbox.setValue(prof['fs'])
+        self.filter_checkbox.setChecked(True)
+        self.filter_type_combo.setCurrentText('Band-pass')
+        self.cutoff_1_spinbox.setValue(prof['cutoff_1']) # 0.5 Hz
+        self.cutoff_2_spinbox.setValue(prof['cutoff_2']) # 20.0 Hz
+        self.filter_order_spinbox.setValue(4)
+        self.detrend_checkbox.setChecked(True)
+        self.detrend_type_combo.setCurrentText('Linear')
+        self.window_length_spinbox.setValue(prof['window_sec'])     # 2.0s -> tự tính 128 mẫu (64Hz) hoặc 120 mẫu (60Hz)
+        self.window_overlap_spinbox.setValue(prof['overlap_pct'])   # 50%
+        self.update_window_parameter_calculation()
+        self._copy_analysis_to_batch()
+        self.batch_controls['target_fs_spinbox'].setValue(prof['fs'])
+        expected_samples = int(prof['fs'] * prof['window_sec'])
+        self.statusBar().showMessage(
+            f"Đã kích hoạt Profile {profile_name}: Fs = {prof['fs']:g} Hz | "
+            f"Cửa sổ = {expected_samples} mẫu ({prof['window_sec']}s) | "
+            f"{prof['channels']} kênh | {prof['subjects']} ca | Band-pass 0.5–20 Hz"
+        )
 
     def create_dataset_page(self):
         page = QWidget()
@@ -2142,10 +2229,10 @@ class FOGSignalAnalyzer(QMainWindow):
         return (wid, item, meta)
 
     def _get_processed_signal_for(self, item, sensor, axis):
-        cols = {'Ankle': ['Ankle_Forward_mg', 'Ankle_Vertical_mg', 'Ankle_Lateral_mg'], 'Thigh': ['Thigh_Forward_mg', 'Thigh_Vertical_mg', 'Thigh_Lateral_mg'], 'Trunk': ['Trunk_Forward_mg', 'Trunk_Vertical_mg', 'Trunk_Lateral_mg']}
-        col = cols[sensor][{'X': 0, 'Y': 1, 'Z': 2}[axis]]
+        axis_name = {'X': 'Forward', 'Y': 'Vertical', 'Z': 'Lateral'}[axis]
+        col = f'{sensor}_{axis_name}_mg'
         if col not in item['Signals']:
-            raise ValueError(f'Windowing chưa lưu {sensor} Axis {axis}. Hãy chọn axis tương ứng trong Phase 4.')
+            raise ValueError(f'Windowing chưa lưu {sensor} Axis {axis}. Hãy chọn đúng Sensor/Axis trong tab Windowing.')
         return (np.asarray(item['Time'], float), np.asarray(item['Signals'][col], float), col)
 
     def _get_raw_signal_for(self, time_array, column):
@@ -2858,11 +2945,17 @@ class FOGSignalAnalyzer(QMainWindow):
         self.batch_sensor_checks = {}
         self.batch_axis_checks = {}
         cg.addWidget(QLabel('Vị trí (1–3 cảm biến)'), 0, 0)
-        for col, sensor in enumerate(GUI_SENSORS, 1):
+        for idx_s, sensor in enumerate(GUI_SENSORS):
             check = QCheckBox(sensor)
             check.setChecked(sensor == 'Ankle')
             self.batch_sensor_checks[sensor] = check
-            cg.addWidget(check, 0, col)
+            cg.addWidget(check, idx_s // 4, (idx_s % 4) + 1)
+        cg.addWidget(QLabel('Trục (1–3 mỗi cảm biến)'), 3, 0)
+        for col, axis in enumerate(GUI_AXES, 1):
+            check = QCheckBox(axis)
+            check.setChecked(True)
+            self.batch_axis_checks[axis] = check
+            cg.addWidget(check, 3, col)
         cg.addWidget(QLabel('Trục (1–3 mỗi cảm biến)'), 1, 0)
         for col, axis in enumerate(GUI_AXES, 1):
             check = QCheckBox(axis)
@@ -3175,7 +3268,8 @@ class FOGSignalAnalyzer(QMainWindow):
         self._refresh_selected()
 
     def _window_input(self):
-        return (self.processed_runs, self.processed_sampling_rate) if self.preprocessing_applied else (self.selected_runs, 64.0)
+        default_fs = float(self.sampling_rate or 64.0)
+        return (self.processed_runs, self.processed_sampling_rate) if self.preprocessing_applied else (self.selected_runs, default_fs)
 
     def _install_windows(self, result, config, fs):
         config = dict(config)
@@ -3280,7 +3374,7 @@ class FOGSignalAnalyzer(QMainWindow):
         self._batch_changed()
 
     def _add_files(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, 'Add DAPHNET TXT recordings', '', 'DAPHNET (*.txt)')
+        paths, _ = QFileDialog.getOpenFileNames(self, 'Add Raw Recordings', '', 'Raw Datasets (*.txt *.csv)')
         self.batch_files = list(dict.fromkeys(self.batch_files + [str(Path(p).resolve()) for p in paths]))
         self._sync_batch_list()
 
@@ -3381,10 +3475,36 @@ class FOGSignalAnalyzer(QMainWindow):
             controls[name] = w.isChecked() if isinstance(w, QCheckBox) else w.currentText() if isinstance(w, QComboBox) else w.value()
         sensors = [s for s, w in self.batch_sensor_checks.items() if w.isChecked()]
         axes = [a for a, w in self.batch_axis_checks.items() if w.isChecked()]
-        controls['windowing_sensor_combo'] = sensors[0] if sensors else 'Ankle'
+        
+        has_fog_star = any(s in FOG_STAR_SENSORS for s in sensors)
+        has_daphnet = any(s in DAPHNET_SENSORS for s in sensors)
+        if has_fog_star and has_daphnet:
+            raise ValueError('Không chọn trộn lẫn cảm biến DAPHNET (Ankle/Thigh/Trunk) và FoG-STAR trong cùng một lần chạy.')
+            
+        batch_source_fs = 60.0 if has_fog_star else 64.0
+        controls['windowing_sensor_combo'] = sensors[0] if sensors else ('AnkleL_Acc' if has_fog_star else 'Ankle')
         for axis, key in zip(GUI_AXES, ['windowing_axis_x_checkbox', 'windowing_axis_y_checkbox', 'windowing_axis_z_checkbox']):
             controls[key] = axis in axes
-        return canonical_config(dict(schema='original-core-gui-v1', source_fs=64.0, feature_schema='one-window-per-row', sensors=sensors, axes=axes, selection=dict(mode=self.batch_scope.currentIndex(), start=self.batch_start.value(), end=self.batch_end.value(), exclude_zero=self.batch_exclude_zero.isChecked()), controls=controls, feature_options=self._get_feature_options('batch'), excluded_regions=copy.deepcopy(self.excluded_regions), filter_implementation='original filtfilt; lfilter fallback on short segments', label_mapping={'0': None, '1': 0, '2': 1}, processing_order=['selection', 'recording_exclusions', 'split_runs', 'resample', 'filter', 'detrend', 'windowing', 'features']))
+            
+        return canonical_config(dict(
+            schema='original-core-gui-v1',
+            source_fs=batch_source_fs,  # ĐÃ SỬA: truyền batch_source_fs (60.0 hoặc 64.0) thay vì 64.0 cứng
+            feature_schema='one-window-per-row',
+            sensors=sensors,
+            axes=axes,
+            selection=dict(
+                mode=self.batch_scope.currentIndex(),
+                start=self.batch_start.value(),
+                end=self.batch_end.value(),
+                exclude_zero=self.batch_exclude_zero.isChecked()
+            ),
+            controls=controls,
+            feature_options=self._get_feature_options('batch'),
+            excluded_regions=copy.deepcopy(self.excluded_regions),
+            filter_implementation='original filtfilt; lfilter fallback on short segments',
+            label_mapping={'0': None, '1': 0, '2': 1},
+            processing_order=['selection', 'recording_exclusions', 'split_runs', 'resample', 'filter', 'detrend', 'windowing', 'features']
+        ))
 
     def _batch_changed(self, *args):
         if not hasattr(self, 'batch_summary'):
@@ -3641,18 +3761,36 @@ class FOGSignalAnalyzer(QMainWindow):
         for name in self.CONTROL_NAMES:
             widget = getattr(self, name)
             controls[name] = widget.isChecked() if isinstance(widget, QCheckBox) else widget.currentText() if isinstance(widget, QComboBox) else widget.value()
-        config = {'schema': 'original-core-gui-v1', 'source_fs': 64.0, 'feature_schema': 'one-window-sensor-axis-per-row', 'selection': {'mode': self.selection_mode.currentIndex(), 'start': self.selection_start.value(), 'end': self.selection_end.value(), 'exclude_zero': self.selection_exclude.isChecked()}, 'controls': controls, 'filter_implementation': 'original filtfilt; lfilter fallback on short segments', 'label_mapping': {'0': None, '1': 0, '2': 1}, 'processing_order': ['selection', 'resample', 'filter', 'detrend', 'windowing']}
+        config = {'schema': 'original-core-gui-v1', 'source_fs': float(self.sampling_rate or 64.0), 'feature_schema': 'one-window-sensor-axis-per-row', 'selection': {'mode': self.selection_mode.currentIndex(), 'start': self.selection_start.value(), 'end': self.selection_end.value(), 'exclude_zero': self.selection_exclude.isChecked()}, 'controls': controls, 'filter_implementation': 'original filtfilt; lfilter fallback on short segments', 'label_mapping': {'0': None, '1': 0, '2': 1}, 'processing_order': ['selection', 'resample', 'filter', 'detrend', 'windowing']}
         config['feature_options']=self._get_feature_options('analysis')
         config = Config.from_dict(config)
         return config
 
     def _install_recording(self, frame, path):
+        detected_fs = float(frame.attrs.get('source_fs', 64.0))
+        is_fog_star = (detected_fs == 60.0) or ('AnkleL_Acc_Forward_mg' in frame.columns)
+        active_sensors = FOG_STAR_SENSORS if is_fog_star else DAPHNET_SENSORS
+
+        for combo in (
+            self.raw_viewer.sensor,
+            self.selected_viewer.sensor,
+            self.windowing_sensor_combo,
+            self.analysis_sensor_combo,
+            self.frequency_sensor_combo,
+        ):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(active_sensors)
+            combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+
+        self.current_sensor = active_sensors[0]
         self.df_raw = frame.copy()
         self.df = gui_labels(frame)
         self.file_path = str(path)
-        self.sampling_rate = 64.0
+        self.sampling_rate = detected_fs
         self.display_df = self.df.copy()
-        self.display_sampling_rate = 64.0
+        self.display_sampling_rate = detected_fs
         self.display_processed_label = False
         self.selected_runs = []
         self.selection_applied = False
@@ -3661,26 +3799,28 @@ class FOGSignalAnalyzer(QMainWindow):
         self.path_label.setToolTip(str(path))
         self.file_value.setText(Path(path).name)
         self.file_value.setToolTip(str(path))
-        self.columns_value.setText('11 raw + label metadata')
+        self.columns_value.setText(f'{len(active_sensors) * 3 + 2} raw + label metadata')
         self.samples_value.setText(f'{len(frame):,}')
-        self.fs_value.setText('64 Hz')
-        self.duration = (frame.Time_ms.iloc[-1] - frame.Time_ms.iloc[0]) / 1000
+        self.fs_value.setText(f'{detected_fs:g} Hz')
+        self.duration = (frame.Time_ms.iloc[-1] - frame.Time_ms.iloc[0]) / 1000.0
         self.duration_value.setText(f'{self.duration:.3f} sec')
         self.show_preview()
         self.label_table.setRowCount(3)
         for r, row in enumerate([(0, 'Outside experiment', '#N/A'), (1, 'Non-FOG', 0), (2, 'FOG', 1)]):
             for col, value in enumerate(row):
-                self.label_table.setItem(r, col, QTableWidgetItem(str(value)))
-        for spin, value in [(self.selection_start, frame.Time_ms.iloc[0] / 1000), (self.selection_end, frame.Time_ms.iloc[-1] / 1000)]:
+             self.label_table.setItem(r, col, QTableWidgetItem(str(value)))
+        for spin, value in [(self.selection_start, frame.Time_ms.iloc[0] / 1000.0), (self.selection_end, frame.Time_ms.iloc[-1] / 1000.0)]:
             spin.blockSignals(True)
-            spin.setRange(frame.Time_ms.iloc[0] / 1000, frame.Time_ms.iloc[-1] / 1000)
+            spin.setRange(frame.Time_ms.iloc[0] / 1000.0, frame.Time_ms.iloc[-1] / 1000.0)
             spin.setValue(value)
             spin.blockSignals(False)
         self.selection_mode.setCurrentIndex(0)
         self.selection_exclude.setChecked(True)
         self.apply_data_selection()
-        self.raw_viewer.set_runs(gui_split(self.df), f'RAW · {Path(path).stem}')
-        self.preprocessing_original_fs_label.setText('64 Hz')
+        self.raw_viewer.set_runs(gui_split(self.df, detected_fs), f'RAW · {Path(path).stem}')
+        self.preprocessing_original_fs_label.setText(f'{detected_fs:g} Hz')
+        self._update_feature_availability('analysis')
+        self._update_feature_summary()
         self._go(self.dataset_page)
 
     def _update_batch_file_list(self):

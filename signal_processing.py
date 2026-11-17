@@ -13,11 +13,19 @@ try:
     from scipy.integrate import trapezoid as _trapezoid_integral
 except ImportError:
     _trapezoid_integral = np.trapz
-from feature_registry import BASE, GROUPS, options, serialize_options, DWT_FEATURES, axis_names, window_names, feature_names, axis_extra, window_extra, temporal_extra, wavelet_module
+
+from feature_registry import (
+    BASE, GROUPS, DAPHNET_SENSORS, FOG_STAR_SENSORS,
+    options, serialize_options, DWT_FEATURES, axis_names,
+    window_names, feature_names, axis_extra, window_extra,
+    temporal_extra, wavelet_module
+)
 PIPELINE_VERSION = 'original14-unified-v1'
-GUI_SENSORS = ('Ankle','Thigh','Trunk')
-GUI_AXES = ('Forward','Vertical','Lateral')
-GUI_COLUMNS = ['Time_ms']+[f'{s}_{a}_mg' for s in GUI_SENSORS for a in GUI_AXES]+['Label']
+GUI_SENSORS = DAPHNET_SENSORS + FOG_STAR_SENSORS
+GUI_AXES = ('Forward', 'Vertical', 'Lateral')
+DAPHNET_COLUMNS = ['Time_ms'] + [f'{s}_{a}_mg' for s in DAPHNET_SENSORS for a in GUI_AXES] + ['Label']
+FOG_STAR_COLUMNS = ['Time_ms'] + [f'{s}_{a}_mg' for s in FOG_STAR_SENSORS for a in GUI_AXES] + ['Label']
+GUI_COLUMNS = DAPHNET_COLUMNS
 
 FOG_STAR_POSITIONS = ('ankleL', 'ankleR', 'back', 'wrist')
 FOG_STAR_MODALITIES = ('acc', 'gyro')
@@ -229,15 +237,9 @@ class ProcessingEngine:
     def get_sensor_columns(self):
 
         return [
-            "Ankle_Forward_mg",
-            "Ankle_Vertical_mg",
-            "Ankle_Lateral_mg",
-            "Thigh_Forward_mg",
-            "Thigh_Vertical_mg",
-            "Thigh_Lateral_mg",
-            "Trunk_Forward_mg",
-            "Trunk_Vertical_mg",
-            "Trunk_Lateral_mg"
+            f"{s}_{a}_mg"
+            for s in GUI_SENSORS
+            for a in GUI_AXES
         ]
     def get_dataframe_time_array(self, dataframe, sampling_rate):
 
@@ -550,105 +552,140 @@ class ProcessingEngine:
         return pd.DataFrame(rows)
 
 def gui_read_raw(path):
-    path=Path(path)
-    if path.suffix.lower()=='.txt':
-        frame=pd.read_csv(path,sep=r'\s+',header=None)
-        if frame.shape[1]!=11: raise ValueError('DAPHNET TXT cần đúng 11 cột.')
-        frame.columns=GUI_COLUMNS
+    path = Path(path)
+    if path.suffix.lower() == '.txt':
+        frame = pd.read_csv(path, sep=r'\s+', header=None)
+        if frame.shape[1] != 11:
+            raise ValueError('DAPHNET TXT cần đúng 11 cột.')
+        frame.columns = DAPHNET_COLUMNS
+        expected_cols = DAPHNET_COLUMNS
     else:
-        frame=pd.read_csv(path)
-        missing=set(GUI_COLUMNS)-set(frame.columns)
-        if missing: raise ValueError('CSV raw thiếu cột: '+', '.join(sorted(missing)))
-        frame=frame[GUI_COLUMNS].copy()
-    if len(frame)<2: raise ValueError('Bản ghi cần ít nhất 2 mẫu.')
-    for col in GUI_COLUMNS: frame[col]=pd.to_numeric(frame[col],errors='raise')
-    if not np.isfinite(frame.to_numpy(float)).all(): raise ValueError('Raw chứa NaN/Inf.')
-    if not frame.Label.isin([0,1,2]).all(): raise ValueError('Nhãn DAPHNET phải là 0, 1 hoặc 2.')
-    dt=np.diff(frame.Time_ms.to_numpy(float)/1000)
-    if not np.all(dt>0): raise ValueError('Timestamp phải tăng nghiêm ngặt.')
-    if not np.isclose(np.median(dt),1/64,rtol=.04): raise ValueError('File raw không có bước thời gian DAPHNET 64 Hz.')
+        frame = pd.read_csv(path)
+        if set(FOG_STAR_COLUMNS).issubset(frame.columns):
+            expected_cols = FOG_STAR_COLUMNS
+        elif set(DAPHNET_COLUMNS).issubset(frame.columns):
+            expected_cols = DAPHNET_COLUMNS
+        else:
+            raise ValueError(
+                'CSV không khớp 9 kênh DAPHNET hoặc 24 kênh FoG-STAR. '
+                'Nếu là sensor_data.csv gốc, hãy chạy split_fog_star.py trước.'
+            )
+        frame = frame[expected_cols].copy()
+
+    if len(frame) < 2:
+        raise ValueError('Bản ghi cần ít nhất 2 mẫu.')
+    for col in expected_cols:
+        frame[col] = pd.to_numeric(frame[col], errors='raise')
+    if not np.isfinite(frame.to_numpy(float)).all():
+        raise ValueError('Raw chứa NaN/Inf.')
+    if not frame.Label.isin([0, 1, 2]).all():
+        raise ValueError('Nhãn phải là 0, 1 hoặc 2.')
+
+    dt = np.diff(frame.Time_ms.to_numpy(float) / 1000.0)
+    if not np.all(dt > 0):
+        raise ValueError('Timestamp phải tăng nghiêm ngặt.')
+    median_dt = float(np.median(dt))
+    if np.isclose(median_dt, 1.0 / 64.0, rtol=0.05):
+        frame.attrs['source_fs'] = 64.0
+        frame.attrs['profile'] = 'DAPHNET'
+    elif np.isclose(median_dt, 1.0 / 60.0, rtol=0.05):
+        frame.attrs['source_fs'] = 60.0
+        frame.attrs['profile'] = 'FOG_STAR'
+    else:
+        raise ValueError(f'Bước thời gian không khớp 64 Hz hoặc 60 Hz (median dt={median_dt:.5f}s).')
     return frame
+
 
 def gui_labels(frame):
-    frame=frame.copy();frame['Original_Label']=frame.Label
-    frame['Binary_Label']=frame.Label.map({0:'Outside Experiment', 1:0., 2:1.})
-    frame['Valid_Experiment']=frame.Label.isin([1,2])
+    source_fs = frame.attrs.get('source_fs', 64.0)
+    profile = frame.attrs.get('profile', 'DAPHNET')
+    frame = frame.copy()
+    frame.attrs['source_fs'] = source_fs
+    frame.attrs['profile'] = profile
+    frame['Original_Label'] = frame.Label
+    frame['Binary_Label'] = frame.Label.map({0: 'Outside Experiment', 1: 0., 2: 1.})
+    frame['Valid_Experiment'] = frame.Label.isin([1, 2])
     return frame
 
-def gui_split(frame,fs=64.,valid_only=False):
-    if frame is None or frame.empty:return []
-    data=frame.loc[frame.Original_Label.isin([1,2])].copy() if valid_only else frame.copy()
-    if data.empty:return []
-    t=data.Time_ms.to_numpy(float)/1000
-    valid=data.Original_Label.isin([1,2]).to_numpy()
-    boundaries=np.flatnonzero((np.diff(t)>1.5/fs)|(valid[1:]!=valid[:-1]))+1
-    return [(i+1,part.copy()) for i,part in enumerate([data.iloc[a:b] for a,b in zip(np.r_[0,boundaries],np.r_[boundaries,len(data)])]) if len(part)]
 
-def _select_scope(frame,config):
-    scope=config['selection'];mask=np.ones(len(frame),bool)
-    if scope['mode']==0:mask &= frame.Original_Label.isin([1,2]).to_numpy()
-    if scope['mode']==1:
-        if scope['end']<=scope['start']:raise ValueError('End phải lớn hơn Start.')
-        t=frame.Time_ms.to_numpy()/1000
-        mask &= (t>=scope['start'])&(t<=scope['end'])
-    if scope['exclude_zero']:mask &= frame.Original_Label.isin([1,2]).to_numpy()
-    return gui_split(frame.loc[mask],64.)
+def gui_split(frame, fs=64., valid_only=False):
+    if frame is None or frame.empty:
+        return []
+    fs = float(frame.attrs.get('source_fs', fs) or 64.0)
+    data = frame.loc[frame.Original_Label.isin([1, 2])].copy() if valid_only else frame.copy()
+    if data.empty:
+        return []
+    t = data.Time_ms.to_numpy(float) / 1000.0
+    valid = data.Original_Label.isin([1, 2]).to_numpy()
+    boundaries = np.flatnonzero((np.diff(t) > 1.5 / fs) | (valid[1:] != valid[:-1])) + 1
+    return [
+        (i + 1, part.copy())
+        for i, part in enumerate([
+            data.iloc[a:b] for a, b in zip(np.r_[0, boundaries], np.r_[boundaries, len(data)])
+        ])
+        if len(part)
+    ]
+
+
+def _select_scope(frame, config):
+    source_fs = float(config.get('source_fs', frame.attrs.get('source_fs', 64.0)))
+    scope = config['selection']
+    mask = np.ones(len(frame), bool)
+    if scope['mode'] == 0:
+        mask &= frame.Original_Label.isin([1, 2]).to_numpy()
+    if scope['mode'] == 1:
+        if scope['end'] <= scope['start']:
+            raise ValueError('End phải lớn hơn Start.')
+        t = frame.Time_ms.to_numpy() / 1000.0
+        mask &= (t >= scope['start']) & (t <= scope['end'])
+    if scope['exclude_zero']:
+        mask &= frame.Original_Label.isin([1, 2]).to_numpy()
+    return gui_split(frame.loc[mask], source_fs)
+
+
 def _append_trunk_posture_branch(frame, fs, config):
-    """
-    Tạo nhánh low-pass riêng để ước lượng thành phần trọng lực của Trunk.
-    Tín hiệu đầu vào và đầu ra đều giữ đơn vị mg.
-    """
 
     fo = options(config)
 
     if not fo['apa']:
+
         return frame
-
     cutoff = float(fo['apa_gravity_cutoff_hz'])
-
     if not 0 < cutoff < fs / 2:
         raise ValueError('APA gravity cutoff phải nhỏ hơn Nyquist.')
-
     data = frame.copy()
-
-    sos = signal.butter(
-        2,
-        cutoff,
-        btype='lowpass',
-        fs=fs,
-        output='sos'
-    )
-
+    sos = signal.butter(2, cutoff, btype='lowpass', fs=fs, output='sos')
+    trunk_sensor = 'Trunk' if 'Trunk_Forward_mg' in data.columns else 'Back_Acc'
     for axis in GUI_AXES:
-        source = f'Trunk_{axis}_mg'
+        source = f'{trunk_sensor}_{axis}_mg'
         target = f'Trunk_Posture_{axis}_mg'
-
         values = data[source].to_numpy(dtype=float)
-
         zi = signal.sosfilt_zi(sos) * values[0]
-
-        filtered, _ = signal.sosfilt(
-            sos,
-            values,
-            zi=zi
-        )
-
+        filtered, _ = signal.sosfilt(sos, values, zi=zi)
         data[target] = filtered
-
     return data
-def gui_process(runs,config):
-    config=Config.from_dict(config)
-    engine=ProcessingEngine(config);controls=config['controls'];fs=64.
-    if controls['resample_checkbox']:fs=float(controls['target_fs_spinbox'])
-    output=[]
-    for sid,frame in runs:
-        data=frame.copy()
-        if controls['resample_checkbox']:data=engine.resample_dataframe(data,64.,fs)
-        if options(config)['apa']: data = _append_trunk_posture_branch(data, fs, config)
-        if controls['filter_checkbox']:data=engine.apply_filter_to_dataframe(data,fs)
-        if controls['detrend_checkbox']:data=engine.apply_detrend_to_dataframe(data)
-        data=gui_labels(data);output.append((sid,data))
-    return output,fs
+
+def gui_process(runs, config):
+    config = Config.from_dict(config)
+    engine = ProcessingEngine(config)
+    controls = config['controls']
+    source_fs = float(config.get('source_fs', 64.0))
+    fs = float(controls['target_fs_spinbox']) if controls['resample_checkbox'] else source_fs
+    output = []
+    for sid, frame in runs:
+        data = frame.copy()
+        if controls['resample_checkbox']:
+            data = engine.resample_dataframe(data, source_fs, fs)
+        if options(config)['apa']:
+            data = _append_trunk_posture_branch(data, fs, config)
+        if controls['filter_checkbox']:
+            data = engine.apply_filter_to_dataframe(data, fs)
+        if controls['detrend_checkbox']:
+            data = engine.apply_detrend_to_dataframe(data)
+        data.attrs['source_fs'] = fs
+        data = gui_labels(data)
+        output.append((sid, data))
+    return output, fs
 
 def gui_windows(runs,config,fs):
     config=Config.from_dict(config)
@@ -661,7 +698,7 @@ def gui_windows(runs,config,fs):
     sensor = c['windowing_sensor_combo']
     columns = [f'{sensor}_{a}_mg' for a in axes]
 
-    if sensor == 'Trunk' and options(config)['apa']:
+    if sensor in ('Trunk', 'Back_Acc') and options(config)['apa']:
         columns.extend([
             'Trunk_Posture_Forward_mg',
             'Trunk_Posture_Vertical_mg',
@@ -734,6 +771,7 @@ def _canonicalize_dict(config):
         c=result['controls']
         for key in ['resample_checkbox','filter_checkbox','detrend_checkbox','windowing_axis_x_checkbox','windowing_axis_y_checkbox','windowing_axis_z_checkbox']:
             if not isinstance(c[key],bool):raise ValueError(key+' cần true/false.')
+        
         source_fs = float(result.get('source_fs', 64.0))
         if source_fs not in (60.0, 64.0):
             raise ValueError('source_fs phải là 64 Hz (DAPHNET) hoặc 60 Hz (FoG-STAR).')
@@ -742,7 +780,7 @@ def _canonicalize_dict(config):
         if c['detrend_type_combo'] not in ['Linear','Constant']:raise ValueError('Detrend type không hợp lệ.')
         if not 0<c['window_fog_threshold_spinbox']<=100:raise ValueError('FOG threshold phải >0 và <=100%.')
         if not np.isfinite(c['window_length_spinbox']):raise ValueError('Window length không hợp lệ.')
-        fs=c['target_fs_spinbox'] if c['resample_checkbox'] else 64.
+        fs = float(c['target_fs_spinbox']) if c['resample_checkbox'] else source_fs
         if not np.isfinite(fs) or fs<16:raise ValueError('Export features cần Fs >= 16 Hz.')
         sensors=result.get('sensors',[c['windowing_sensor_combo']]);axes=result.get('axes',[a for a,k in zip(GUI_AXES,['windowing_axis_x_checkbox','windowing_axis_y_checkbox','windowing_axis_z_checkbox']) if c[k]])
         if not sensors or len(set(sensors))!=len(sensors) or any(s not in GUI_SENSORS for s in sensors):raise ValueError('Chọn 1–3 vị trí cảm biến.')
@@ -817,7 +855,7 @@ def _canonicalize_dict(config):
     effective=copy.deepcopy(result)
     if effective['selection']['mode']!=1:effective['selection'].update(start=None,end=None)
     ec=effective['controls']
-    if not ec['resample_checkbox']:ec['target_fs_spinbox']=64.
+    if not ec['resample_checkbox']:ec['target_fs_spinbox'] = source_fs
     if not ec['filter_checkbox']:
         for key in ['filter_type_combo','filter_order_spinbox','cutoff_1_spinbox','cutoff_2_spinbox']:ec[key]=None
     elif ec['filter_type_combo']!='Band-pass':ec['cutoff_2_spinbox']=None
@@ -866,7 +904,7 @@ def gui_select(frame,config):
 
 def prepare_recording(path, config):
     path = Path(path)
-    # Tự động nhận diện file FoG-STAR CSV
+
     if path.suffix.lower() == '.csv':
         header_cols = set(pd.read_csv(path, nrows=1).columns.str.strip())
         if 'fog' in header_cols or 'ankleL_acc_x' in header_cols:
